@@ -1,0 +1,20 @@
+# Environment & secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Temp observation data (recreated every turn)
+scratch/
+
+# Session transcripts (local history, auto-created)
+convo/
+
+# Knowledge base fixes log (local history, auto-created)
+kb/fixes.log
+
+# OS junk
+.DS_Store
+Thumbs.db

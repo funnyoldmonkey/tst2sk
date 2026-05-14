@@ -1,0 +1,183 @@
+{
+  "schema_version": "1.0.0",
+  "workspaceRoot": "C:\\xampp\\htdocs\\projects\\1_OPENCODE_PROJECTS\\tst2sk",
+  "nodes": {
+    "C:/xampp/htdocs/projects/1_OPENCODE_PROJECTS/tst2sk/ai/__init__.py": {
+      "filePath": "C:\\xampp\\htdocs\\projects\\1_OPENCODE_PROJECTS\\tst2sk\\ai\\__init__.py",
+      "moduleName": "ai/__init__.py",
+      "exports": [],
+      "imports": [],
+      "language": "python",
+      "mtime": "2026-05-14T10:27:42.620Z"
+    },
+    "C:/xampp/htdocs/projects/1_OPENCODE_PROJECTS/tst2sk/browser/__init__.py": {
+      "filePath": "C:\\xampp\\htdocs\\projects\\1_OPENCODE_PROJECTS\\tst2sk\\browser\\__init__.py",
+      "moduleName": "browser/__init__.py",
+      "exports": [],
+      "imports": [],
+      "language": "python",
+      "mtime": "2026-05-14T10:27:42.609Z"
+    },
+    "C:/xampp/htdocs/projects/1_OPENCODE_PROJECTS/tst2sk/config.py": {
+      "filePath": "C:\\xampp\\htdocs\\projects\\1_OPENCODE_PROJECTS\\tst2sk\\config.py",
+      "moduleName": "config.py",
+      "exports": [
+        "PROVIDER_PRESETS",
+        "AppConfig"
+      ],
+      "imports": [],
+      "language": "python",
+      "mtime": "2026-05-14T10:28:06.446Z"
+    },
+    "C:/xampp/htdocs/projects/1_OPENCODE_PROJECTS/tst2sk/engine/__init__.py": {
+      "filePath": "C:\\xampp\\htdocs\\projects\\1_OPENCODE_PROJECTS\\tst2sk\\engine\\__init__.py",
+      "moduleName": "engine/__init__.py",
+      "exports": [],
+      "imports": [],
+      "language": "python",
+      "mtime": "2026-05-14T10:27:42.623Z"
+    },
+    "C:/xampp/htdocs/projects/1_OPENCODE_PROJECTS/tst2sk/browser/observer.py": {
+      "filePath": "C:\\xampp\\htdocs\\projects\\1_OPENCODE_PROJECTS\\tst2sk\\browser\\observer.py",
+      "moduleName": "browser/observer.py",
+      "exports": [
+        "capture_observation"
+      ],
+      "imports": [],
+      "language": "python",
+      "mtime": "2026-05-14T10:29:08.081Z"
+    },
+    "C:/xampp/htdocs/projects/1_OPENCODE_PROJECTS/tst2sk/browser/actions.py": {
+      "filePath": "C:\\xampp\\htdocs\\projects\\1_OPENCODE_PROJECTS\\tst2sk\\browser\\actions.py",
+      "moduleName": "browser/actions.py",
+      "exports": [
+        "execute_action"
+      ],
+      "imports": [],
+      "language": "python",
+      "mtime": "2026-05-14T10:29:54.030Z"
+    },
+    "C:/xampp/htdocs/projects/1_OPENCODE_PROJECTS/tst2sk/ai/prompts.py": {
+      "filePath": "C:\\xampp\\htdocs\\projects\\1_OPENCODE_PROJECTS\\tst2sk\\ai\\prompts.py",
+      "moduleName": "ai/prompts.py",
+      "exports": [
+        "SYSTEM_PROMPT"
+      ],
+      "imports": [],
+      "language": "python",
+      "mtime": "2026-05-14T10:31:16.333Z"
+    },
+    "C:/xampp/htdocs/projects/1_OPENCODE_PROJECTS/tst2sk/engine/search.py": {
+      "filePath": "C:\\xampp\\htdocs\\projects\\1_OPENCODE_PROJECTS\\tst2sk\\engine\\search.py",
+      "moduleName": "engine/search.py",
+      "exports": [
+        "SCRATCH_DIR",
+        "search_file",
+        "search_dom",
+        "search_console",
+        "search_network",
+        "read_network_body"
+      ],
+      "imports": [],
+      "language": "python",
+      "mtime": "2026-05-14T10:31:57.009Z"
+    },
+    "C:/xampp/htdocs/projects/1_OPENCODE_PROJECTS/tst2sk/engine/diagnostics.py": {
+      "filePath": "C:\\xampp\\htdocs\\projects\\1_OPENCODE_PROJECTS\\tst2sk\\engine\\diagnostics.py",
+      "moduleName": "engine/diagnostics.py",
+      "exports": [
+        "SCRATCH_DIR",
+        "cross_reference_diagnostics"
+      ],
+      "imports": [],
+      "language": "python",
+      "mtime": "2026-05-14T10:32:21.691Z"
+    },
+    "C:/xampp/htdocs/projects/1_OPENCODE_PROJECTS/tst2sk/engine/kb.py": {
+      "filePath": "C:\\xampp\\htdocs\\projects\\1_OPENCODE_PROJECTS\\tst2sk\\engine\\kb.py",
+      "moduleName": "engine/kb.py",
+      "exports": [
+        "KB_DIR",
+        "KB_FIXES_LOG",
+        "PLAYBOOKS_PATH",
+        "ensure_kb_dir",
+        "append_fix",
+        "search_fixes",
+        "search_playbook",
+        "find_relevant_fixes"
+      ],
+      "imports": [],
+      "language": "python",
+      "mtime": "2026-05-14T11:25:15.117Z"
+    },
+    "C:/xampp/htdocs/projects/1_OPENCODE_PROJECTS/tst2sk/ai/client.py": {
+      "filePath": "C:\\xampp\\htdocs\\projects\\1_OPENCODE_PROJECTS\\tst2sk\\ai\\client.py",
+      "moduleName": "ai/client.py",
+      "exports": [
+        "AIClient"
+      ],
+      "imports": [],
+      "language": "python",
+      "mtime": "2026-05-14T11:31:54.331Z"
+    },
+    "C:/xampp/htdocs/projects/1_OPENCODE_PROJECTS/tst2sk/web_server.py": {
+      "filePath": "C:\\xampp\\htdocs\\projects\\1_OPENCODE_PROJECTS\\tst2sk\\web_server.py",
+      "moduleName": "web_server.py",
+      "exports": [
+        "Session",
+        "SessionManager",
+        "get_index",
+        "websocket_endpoint"
+      ],
+      "imports": [],
+      "language": "python",
+      "mtime": "2026-05-14T11:45:50.365Z"
+    },
+    "C:/xampp/htdocs/projects/1_OPENCODE_PROJECTS/tst2sk/engine/brain.py": {
+      "filePath": "C:\\xampp\\htdocs\\projects\\1_OPENCODE_PROJECTS\\tst2sk\\engine\\brain.py",
+      "moduleName": "engine/brain.py",
+      "exports": [
+        "SCRATCH_DIR",
+        "SCRATCH_NET_BODIES",
+        "LOCAL_ACTIONS",
+        "Brain",
+        "SCRATCH_DIR",
+        "SCRATCH_NET_BODIES",
+        "LOCAL_ACTIONS",
+        "Brain"
+      ],
+      "imports": [],
+      "language": "python",
+      "mtime": "2026-05-14T11:46:49.072Z"
+    },
+    "C:/xampp/htdocs/projects/1_OPENCODE_PROJECTS/tst2sk/main.py": {
+      "filePath": "C:\\xampp\\htdocs\\projects\\1_OPENCODE_PROJECTS\\tst2sk\\main.py",
+      "moduleName": "main.py",
+      "exports": [
+        "LOGO",
+        "ensure_single_instance",
+        "main"
+      ],
+      "imports": [],
+      "language": "python",
+      "mtime": "2026-05-14T12:12:47.074Z"
+    },
+    "C:/xampp/htdocs/projects/1_OPENCODE_PROJECTS/tst2sk/browser/controller.py": {
+      "filePath": "C:\\xampp\\htdocs\\projects\\1_OPENCODE_PROJECTS\\tst2sk\\browser\\controller.py",
+      "moduleName": "browser/controller.py",
+      "exports": [
+        "BrowserController"
+      ],
+      "imports": [],
+      "language": "python",
+      "mtime": "2026-05-14T12:20:39.918Z"
+    }
+  },
+  "edges": [],
+  "metadata": {
+    "generatedAt": "2026-05-14T12:20:39.938Z",
+    "generator": "repo-graph",
+    "nodeCount": 15,
+    "edgeCount": 0
+  }
+}
