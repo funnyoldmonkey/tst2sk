@@ -1,4 +1,4 @@
-
+<center>
 <p align="center">
 <pre>
   ████████╗ ███████╗    ████████╗ ██████╗     ███████╗ ██╗  ██╗
@@ -9,6 +9,7 @@
      ╚═╝    ╚══════╝       ╚═╝    ╚══════╝    ╚══════╝ ╚═╝  ╚═╝
 </pre>
 </p>
+</center>
 
 <h3 align="center">Troubleshooting Tier 2 Sidekick</h3>
 <p align="center"><b>Autonomous web page investigator and fixer</b></p>
