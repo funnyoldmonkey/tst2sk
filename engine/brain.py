@@ -39,6 +39,33 @@ LOCAL_ACTIONS = {
 _CLOSE_KEYWORD = "end"
 
 
+def _read_multiline_input(prompt: str = "\n[You] > ") -> str:
+    """Read user input with multi-line paste support.
+
+    Reads lines until the user submits an empty line (just hits Enter).
+    Quick commands ('end', 'copy') submit immediately on a single line.
+    """
+    first_line = input(prompt)
+
+    # Quick commands — submit immediately, no need for blank line
+    stripped = first_line.strip().lower()
+    if stripped in (_CLOSE_KEYWORD, "copy", ""):
+        return first_line.strip()
+
+    # Multi-line mode: keep reading until blank line
+    lines = [first_line]
+    while True:
+        try:
+            line = input("  ... ")
+            if line.strip() == "":
+                break  # Blank line = submit
+            lines.append(line)
+        except EOFError:
+            break
+
+    return "\n".join(lines).strip()
+
+
 class Brain:
     """The autonomous troubleshooting agent loop."""
 
@@ -355,8 +382,8 @@ class Brain:
                 if positive_fix_signals:
                     self.convo.mark_resolved()
 
-                # Wait for user input
-                user_input = input("\n[You] > ").strip()
+                # Wait for user input (supports multi-line paste)
+                user_input = _read_multiline_input()
 
                 # Handle 'copy' command
                 if user_input.lower() == "copy":
@@ -365,7 +392,7 @@ class Brain:
                         console.print(f"[bold cyan]{result}[/bold cyan]")
                     else:
                         console.print("[dim]No fix code available to copy.[/dim]")
-                    user_input = input("\n[You] > ").strip()
+                    user_input = _read_multiline_input()
 
                 if self._is_close_input(user_input):
                     # Auto-log fix to KB if fixes were applied
@@ -507,14 +534,8 @@ class Brain:
         if relevant:
             context["relevant_fixes"] = relevant
 
-        past_sessions = search_conversations(query)
-        if not past_sessions and url:
-            from urllib.parse import urlparse
-            domain = urlparse(url).netloc
-            if domain:
-                past_sessions = search_conversations(domain)
-        if past_sessions:
-            context["past_sessions"] = past_sessions
+        # Past sessions (convo/) are saved for manual reference but NOT auto-injected.
+        # The AI can still use search_conversations / get_conversation_detail if needed.
 
         context_json = self._safe_json_truncate(context, 8000)
         if self.multimodal:

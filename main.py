@@ -8,7 +8,7 @@ from rich.align import Align
 from rich.text import Text
 
 from config import AppConfig
-from engine.brain import Brain
+from engine.brain import Brain, _read_multiline_input
 
 console = Console()
 
@@ -109,7 +109,7 @@ async def main():
     if not url.startswith("http"):
         url = "https://" + url
 
-    query = input("❓ Your concern: ").strip()
+    query = _read_multiline_input("❓ Your concern: ")
     if not query:
         query = "Investigate the page for any issues."
 

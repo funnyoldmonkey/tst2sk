@@ -21,3 +21,7 @@ kb/fixes.log
 # OS junk
 .DS_Store
 Thumbs.db
+
+#OpenCode files
+.opencode/
+.swarm/
