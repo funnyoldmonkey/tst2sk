@@ -373,7 +373,6 @@ Open `playbooks/PLAYBOOKS.md` and append a new entry at the bottom. Copy this te
   ```
 - Verify: [How to confirm the fix worked — run_test assertion, inspect_element check, or visual confirmation.]
 - Notes: [Optional. Edge cases, variations, or things to watch out for.]
-```
 
 **Real example** — paste this directly into your `PLAYBOOKS.md` to try it:
 
@@ -394,7 +393,7 @@ Open `playbooks/PLAYBOOKS.md` and append a new entry at the bottom. Copy this te
   ```
 - Verify: `run_test` with `parseFloat(getComputedStyle(document.querySelector('.price')).opacity) === 1` and confirm price text is not empty.
 - Notes: If the price shows as $0.00 or wrong value after making it visible, the issue is data-level (variant JSON or Liquid), not CSS. Escalate to Level 2 (inject_js) to read the variant data from `window.ShopifyAnalytics.meta` or the product JSON.
-```
+
 
 ### Session Transcripts
 
