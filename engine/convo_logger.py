@@ -19,6 +19,8 @@ import json
 import time
 import platform
 import subprocess
+import threading
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -77,10 +79,22 @@ def _load_tag_index() -> dict:
 
 
 def _save_tag_index(index: dict):
-    """Write the tag index to disk."""
+    """Write the tag index to disk atomically (write to temp, then rename)."""
     os.makedirs(CONVO_DIR, exist_ok=True)
-    with open(TAG_INDEX_PATH, "w", encoding="utf-8") as f:
-        json.dump(index, f, indent=2, ensure_ascii=False)
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=CONVO_DIR, suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(index, f, indent=2, ensure_ascii=False)
+        # Atomic rename (on same filesystem)
+        os.replace(tmp_path, TAG_INDEX_PATH)
+    except Exception:
+        # Fallback to direct write if atomic fails
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        with open(TAG_INDEX_PATH, "w", encoding="utf-8") as f:
+            json.dump(index, f, indent=2, ensure_ascii=False)
 
 
 def _update_tag_index(filename: str, tags: list[str]):
@@ -207,6 +221,7 @@ class ConvoLogger:
         self.diagnosis_hints: list[str] = []
         self.resolved = False
         self._saved = False
+        self._save_lock = threading.Lock()  # Thread-safe save guard
 
     def log(self, msg_type: str, content: any):
         """Add an entry to the conversation log."""
@@ -241,7 +256,12 @@ class ConvoLogger:
         self.resolved = True
 
     def save(self) -> str:
-        """Save the conversation to convo/ and update the tag index."""
+        """Save the conversation to convo/ and update the tag index. Thread-safe."""
+        with self._save_lock:
+            return self._save_inner()
+
+    def _save_inner(self) -> str:
+        """Internal save — must be called under _save_lock."""
         if self._saved:
             return ""
 
@@ -367,7 +387,14 @@ def search_conversations(query: str) -> list[dict]:
 def get_conversation_detail(filename: str) -> dict | None:
     """Load a specific session file for the AI to read the full conversation.
     Called when the AI finds a match via search and wants the details."""
-    filepath = os.path.join(CONVO_DIR, filename)
+    # Sanitize filename — prevent path traversal (../../etc/passwd)
+    safe_name = os.path.basename(filename)
+    if not safe_name.startswith("session_") or not safe_name.endswith(".json"):
+        return None
+    filepath = os.path.join(CONVO_DIR, safe_name)
+    # Double-check resolved path stays inside CONVO_DIR
+    if not os.path.realpath(filepath).startswith(os.path.realpath(CONVO_DIR)):
+        return None
     if not os.path.exists(filepath):
         return None
     try:

@@ -47,13 +47,32 @@ def read_network_body(filename: str = "") -> dict:
     if not os.path.exists(bodies_dir):
         return {"available_files": [], "hint": "No network bodies captured yet."}
 
-    if filename:
-        for f in os.listdir(bodies_dir):
+    available = os.listdir(bodies_dir)
+
+    if filename and len(filename) >= 3:
+        # Require at least 3 chars to prevent overly broad matches
+        # Also read the URL line inside the file for better matching
+        for f in available:
+            filepath = os.path.join(bodies_dir, f)
             if filename.lower() in f.lower():
-                with open(os.path.join(bodies_dir, f), "r", encoding="utf-8") as fh:
-                    return {"file": f, "body": fh.read()[:10000]}
+                try:
+                    with open(filepath, "r", encoding="utf-8") as fh:
+                        return {"file": f, "body": fh.read()[:10000]}
+                except Exception:
+                    continue
+        # Second pass: check inside files for URL match
+        for f in available:
+            filepath = os.path.join(bodies_dir, f)
+            try:
+                with open(filepath, "r", encoding="utf-8") as fh:
+                    content = fh.read()
+                    first_line = content.split("\n")[0] if content else ""
+                    if filename.lower() in first_line.lower():
+                        return {"file": f, "body": content[:10000]}
+            except Exception:
+                continue
 
     return {
-        "available_files": os.listdir(bodies_dir),
-        "hint": "Provide a filename or partial match.",
+        "available_files": available,
+        "hint": "Provide a filename or partial match (min 3 chars).",
     }

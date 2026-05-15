@@ -1,6 +1,9 @@
 # Environment & secrets
 .env
 
+# Lockfile
+.tst2sk.lock
+
 # Python
 __pycache__/
 *.pyc

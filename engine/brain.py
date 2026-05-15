@@ -1,4 +1,4 @@
-"""The agent brain — observe, think, act, repeat."""
+"""The agent brain — observe, think, act, repeat. CLI-only."""
 import os
 import re
 import json
@@ -8,7 +8,6 @@ import asyncio
 import atexit
 import signal
 from pathlib import Path
-from typing import Callable, Awaitable, Optional
 from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
@@ -36,12 +35,14 @@ LOCAL_ACTIONS = {
     "get_conversation_detail",
 }
 
+# Session close — single keyword: "end" (case-insensitive)
+_CLOSE_KEYWORD = "end"
+
+
 class Brain:
     """The autonomous troubleshooting agent loop."""
 
-    def __init__(self, config: AppConfig,
-                 output_callback: Optional[Callable[[str, any], Awaitable[None]]] = None,
-                 input_queue: Optional[asyncio.Queue] = None):
+    def __init__(self, config: AppConfig):
         self.config = config
         self.browser = BrowserController(headless=config.headless)
         self.ai = AIClient(config)
@@ -51,26 +52,16 @@ class Brain:
         self.detected_scenario = ""
         self.diagnosis_hints: list[str] = []
 
-        self.output_callback = output_callback
-        self.input_queue = input_queue
         self._last_fix_code = None  # Stores latest fix code for manual copy
         self._fix_copy_offered = False  # Track if copy hint was shown for current fix
         self._recent_actions: list[tuple] = []  # Track (action, payload_key) for loop detection
+        self._consecutive_errors = 0  # Circuit breaker for non-retryable API errors
         self.multimodal = config.multimodal  # True = send screenshots, False = text-only
         self.system_prompt = get_system_prompt(self.multimodal)
-
-        # Wire up retry callback for Web UI mode only
-        # CLI mode: client handles countdown display directly with Rich Live
-        if self.output_callback:
-            self.ai.on_retry = self._on_retry
 
         # Conversation logger — saves session to convo/ on exit
         self.convo = ConvoLogger()
         self._register_exit_hooks()
-
-    async def _on_retry(self, message: str):
-        """Callback from AIClient during retry countdown."""
-        await self._log("retry", message)
 
     def _register_exit_hooks(self):
         """Register atexit + signal handlers to save conversation on any exit."""
@@ -110,116 +101,80 @@ class Brain:
         if filepath and not filepath.startswith("["):
             console.print(f"\n[bold cyan]💾 Session saved to: {filepath}[/bold cyan]")
 
-    async def _log(self, msg_type: str, content: any):
-        """Internal logger that uses the callback if available, else prints to console.
-
-        CLI output is kept clean and conversational:
-        - Thought panel (what the AI is thinking)
-        - Action one-liner (what it's doing)
-        - Compact result summary (not raw JSON dumps)
-        - Agent message (when AI speaks to user)
-        - Retry countdown (live countdown on API errors)
-        """
+    async def _log(self, msg_type: str, content):
+        """Internal logger — prints to CLI with clean formatting."""
         # Always log to conversation logger (full data for session files)
         self.convo.log(msg_type, content)
 
-        if self.output_callback:
-            await self.output_callback(msg_type, content)
-        else:
-            # ─── Clean CLI output ───
-            if msg_type == "thought":
-                console.print(Panel(str(content), title="💭 Thought", style="yellow", expand=False, width=min(console.width, 120)))
+        if msg_type == "thought":
+            console.print(Panel(str(content), title="💭 Thought", style="yellow", expand=False, width=min(console.width, 120)))
 
-            elif msg_type == "action":
-                # Clean action display with context-aware icons
-                action_icons = {
-                    "diagnose": "🔍", "search_dom": "🔍", "search_console": "🔍",
-                    "search_network": "🔍", "search_playbook": "📖", "search_fixes": "📖",
-                    "search_conversations": "📖", "get_conversation_detail": "📖",
-                    "inject_css": "🔧", "inject_js": "🔧",
-                    "click": "👆", "type": "⌨️", "scroll": "📜", "hover": "👆",
-                    "navigate": "🌐", "observe": "👁️", "run_test": "✅",
-                    "post_message": "💬", "answer_user": "💬",
-                    "inspect_element": "🔍", "capture_element": "📸",
-                    "read_network_body": "📡", "get_network_body": "📡",
-                    "clear_site_data": "🗑️", "log_fix": "📝",
-                    "click_at_position": "👆",
-                }
-                icon = action_icons.get(content, "▶️")
-                console.print(f"  {icon} [bold]{content}[/bold]")
+        elif msg_type == "action":
+            action_icons = {
+                "diagnose": "🔍", "search_dom": "🔍", "search_console": "🔍",
+                "search_network": "🔍", "search_playbook": "📖", "search_fixes": "📖",
+                "search_conversations": "📖", "get_conversation_detail": "📖",
+                "inject_css": "🔧", "inject_js": "🔧",
+                "click": "👆", "type": "⌨️", "scroll": "📜", "hover": "👆",
+                "navigate": "🌐", "observe": "👁️", "run_test": "✅",
+                "post_message": "💬", "answer_user": "💬",
+                "inspect_element": "🔍", "capture_element": "📸",
+                "read_network_body": "📡",
+                "clear_site_data": "🗑️", "log_fix": "📝",
+                "click_at_position": "👆",
+            }
+            icon = action_icons.get(content, "▶️")
+            console.print(f"  {icon} [bold]{content}[/bold]")
 
-            elif msg_type == "result":
-                # Compact result summary — no raw JSON dumps
-                self._print_compact_result(content)
+        elif msg_type == "result":
+            self._print_compact_result(content)
 
-            elif msg_type == "agent_message":
-                # Unescape literal \n from JSON strings and render markdown
-                display_content = str(content).replace("\\n", "\n")
-                if "```" in display_content:
-                    # Has code blocks — use Rich Markdown for proper rendering
-                    console.print(Panel(Markdown(display_content), title="🤖 Agent Message", style="bold green"))
-                else:
-                    console.print(Panel(display_content, title="🤖 Agent Message", style="bold green"))
-                # Check if there's a code block — offer manual copy instead of auto-copying
-                self._offer_copy_fix(content)
+        elif msg_type == "agent_message":
+            # Unescape literal \n from JSON strings and render markdown
+            display_content = str(content).replace("\\n", "\n")
+            if "```" in display_content:
+                console.print(Panel(Markdown(display_content), title="🤖 Agent Message", style="bold green"))
+            else:
+                console.print(Panel(display_content, title="🤖 Agent Message", style="bold green"))
+            self._offer_copy_fix(content)
 
-            elif msg_type == "status":
-                # Turn headers get special formatting
-                if "Turn" in str(content):
-                    console.print(f"\n[bold cyan]{content}[/bold cyan]")
-                else:
-                    console.print(f"  [dim]{content}[/dim]")
-
-            elif msg_type == "screenshot":
-                console.print(f"  [dim]📸 Screenshot taken[/dim]")
-
-            elif msg_type == "retry":
-                # Only reached in Web UI mode (CLI uses Rich Live in client directly)
+        elif msg_type == "status":
+            if "Turn" in str(content):
+                console.print(f"\n[bold cyan]{content}[/bold cyan]")
+            else:
                 console.print(f"  [dim]{content}[/dim]")
 
-            elif msg_type == "thought_chunk":
-                pass  # Streaming — skip in CLI (full thought printed after)
+        elif msg_type == "screenshot":
+            console.print(f"  [dim]📸 Screenshot taken[/dim]")
 
-            else:
-                console.print(f"  [{msg_type}] {content}")
+        else:
+            console.print(f"  [{msg_type}] {content}")
 
     def _print_compact_result(self, content):
         """Print a compact, readable summary of action results instead of raw JSON."""
         if isinstance(content, dict):
-            # Diagnose results
             if "detected_scenario" in content:
                 scenario = content.get("detected_scenario", "unknown")
                 conf = content.get("confidence", 0)
                 issues = content.get("potential_issues", [])
                 console.print(f"  [dim]Scenario: {scenario} ({conf}% confidence)[/dim]")
                 for issue in issues[:3]:
-                    # Shorten the issue text
                     short = issue[:80] + "..." if len(issue) > 80 else issue
                     console.print(f"  [dim]  • {short}[/dim]")
-
-            # DOM/console/network search results
             elif "total_matches" in content:
                 total = content.get("total_matches", 0)
                 query = content.get("query", "")
                 console.print(f"  [dim]Found {total} matches for \"{query}\"[/dim]")
-
-            # Playbook/fixes search results
             elif "results" in content:
                 results = content.get("results", [])
                 console.print(f"  [dim]Found {len(results)} result(s)[/dim]")
-
-            # Conversation search results
             elif isinstance(content.get("matches"), list):
                 matches = content.get("matches", [])
                 console.print(f"  [dim]Found {len(matches)} past session(s)[/dim]")
-
-            # Generic dict — show keys only
             else:
                 keys = list(content.keys())[:5]
                 console.print(f"  [dim]Result: {', '.join(keys)}[/dim]")
-
         elif isinstance(content, str):
-            # String result — truncate
             short = content[:120] + "..." if len(content) > 120 else content
             console.print(f"  [dim]{short}[/dim]")
         else:
@@ -227,12 +182,9 @@ class Brain:
 
     def _extract_code_from_message(self, message: str) -> str | None:
         """Extract the largest code block from a message. Returns code or None."""
-        # Unescape literal \n from JSON before regex matching
         text = str(message).replace("\\n", "\n")
-        # Try fenced code blocks first (```code```)
         code_blocks = re.findall(r'```(?:\w+)?\s*\n(.*?)```', text, re.DOTALL)
         if not code_blocks:
-            # Try inline backtick blocks (`code`)
             code_blocks = re.findall(r'`([^`]{10,})`', text)
         if code_blocks:
             return max(code_blocks, key=len).strip()
@@ -240,23 +192,25 @@ class Brain:
 
     def _offer_copy_fix(self, message: str):
         """If message has code or we have a recent fix, show hint to type 'copy'."""
-        # First try extracting from the message itself
         fix_code = self._extract_code_from_message(message)
         if fix_code:
             self._last_fix_code = fix_code
-            self._fix_copy_offered = False  # New code found — reset the flag
+            self._fix_copy_offered = False
 
-        # Show hint only once per fix code
         if self._last_fix_code and not self._fix_copy_offered:
             self._fix_copy_offered = True
             console.print(f"[bold cyan]📋 Fix code available — type 'copy' to copy to clipboard[/bold cyan]")
+
+    @staticmethod
+    def _is_close_input(text: str) -> bool:
+        """Check if user typed 'end' to close the session. Case-insensitive."""
+        return text.strip().lower() == _CLOSE_KEYWORD
 
     async def start(self, url: str, user_query: str):
         """Main entry point — navigate to URL and start the loop."""
         os.makedirs(SCRATCH_DIR, exist_ok=True)
         os.makedirs(SCRATCH_NET_BODIES, exist_ok=True)
 
-        # Initialize conversation logger with session info
         self.convo.set_session_info(url, user_query)
 
         mode_label = "🔭 Vision mode (multimodal)" if self.multimodal else "📝 Text-only mode (no screenshots)"
@@ -269,27 +223,22 @@ class Brain:
             await self.browser.navigate(url)
             await self._log("status", f"Navigated to {url}")
 
-            # Wait a moment for page to settle
             await asyncio.sleep(2)
 
-            # Capture initial observation
             obs = await capture_observation(self.browser)
             self._write_scratch_files(obs)
             self._persist_network_bodies()
 
-            # Build initial context message for the AI
             slim_obs = self._build_slim_observation(obs)
             initial_context = self._build_context_message(slim_obs, user_query, obs["url"])
 
             self.messages.append({"role": "user", "content": initial_context})
 
-            # Start the agent loop
             await self._loop(obs["screenshot_base64"])
         except Exception as e:
             await self._log("status", f"Fatal error during startup: {str(e)}")
             raise e
         finally:
-            # Always save conversation regardless of how session ends
             self._save_convo_sync()
 
     async def _loop(self, current_screenshot: str):
@@ -298,73 +247,69 @@ class Brain:
             self.turn_count += 1
             await self._log("status", f"═══ Turn {self.turn_count} ═══")
 
-            # Trim history to prevent context overflow
             self._trim_history()
 
-            # Capture observation (always — we need DOM/console/network regardless)
-            obs = await capture_observation(self.browser)
-            # Only show/send screenshot in multimodal mode
+            # Capture observation — robust against browser crashes
+            try:
+                obs = await capture_observation(self.browser)
+            except Exception as e:
+                await self._log("status", f"⚠️ Observation capture failed: {e}. Retrying...")
+                await asyncio.sleep(2)
+                try:
+                    obs = await capture_observation(self.browser)
+                except Exception as e2:
+                    await self._log("status", f"❌ Observation capture failed twice: {e2}. Ending session.")
+                    break
+
             if self.multimodal:
                 await self._log("screenshot", {"base64": obs["screenshot_base64"], "url": obs["url"]})
 
             # Get action from AI
             try:
-                full_raw_response = ""
-                action_data = None
-
-                # In text-only mode, don't send the screenshot to the AI
                 screenshot_for_ai = current_screenshot if self.multimodal else None
 
-                if self.output_callback:
-                    # Streaming mode for Web UI
-                    async for chunk in self.ai.stream_get_action(
+                # Show thinking spinner while waiting for AI
+                from rich.live import Live
+                from rich.spinner import Spinner
+                from rich.text import Text
+                spinner = Spinner("dots", text="  [dim]Thinking...[/dim]", style="cyan")
+                with Live(spinner, console=console, refresh_per_second=10, transient=True):
+                    action_data, full_raw_response = await self.ai.get_action(
                         self.system_prompt, self.messages, screenshot_for_ai
-                    ):
-                        full_raw_response += chunk
-                        await self._log("thought_chunk", chunk)
+                    )
+                await self._log("thought", action_data.get("thought", ""))
 
-                    # Parse the final result (reuse the smart parser from AIClient)
-                    action_data = AIClient._parse_json_response(full_raw_response)
-                else:
-                    # CLI mode: show thinking spinner while waiting for AI
-                    from rich.live import Live
-                    from rich.spinner import Spinner
-                    from rich.text import Text
-                    spinner = Spinner("dots", text="  [dim]Thinking...[/dim]", style="cyan")
-                    with Live(spinner, console=console, refresh_per_second=10, transient=True) as live:
-                        action_data, raw_response = await self.ai.get_action(
-                            self.system_prompt, self.messages, screenshot_for_ai
-                        )
-                    full_raw_response = raw_response
-                    await self._log("thought", action_data.get("thought", ""))
+                # Reset error counter on success
+                self._consecutive_errors = 0
 
                 thought = action_data.get("thought", "")
                 action = action_data.get("action", "observe")
                 payload = action_data.get("payload", {})
 
                 # ─── Stuck-loop detection ───
-                # Tracks (action, payload_signature) to distinguish productive
-                # investigation (same action, different queries) from stuck loops
-                # (same action, same or empty payload repeated).
                 payload_sig = ""
                 if action == "observe":
-                    payload_sig = ""  # observe always has empty payload
+                    payload_sig = ""
                 elif action in ("search_dom", "search_console", "search_network",
                                 "search_playbook", "search_fixes", "search_conversations"):
                     payload_sig = payload.get("query", "")
                 elif action in ("click", "hover", "inspect_element"):
                     payload_sig = payload.get("selector", "")
+                elif action in ("inject_css", "inject_js"):
+                    # Full content comparison — no truncation to avoid false positives on long scripts
+                    payload_sig = payload.get("code", payload.get("css", ""))
                 else:
-                    payload_sig = str(payload)[:100]
+                    payload_sig = str(payload)
 
                 self._recent_actions.append((action, payload_sig))
                 if len(self._recent_actions) > 5:
                     self._recent_actions = self._recent_actions[-5:]
 
                 # Check last 3: same action AND same payload = stuck
+                # Excludes run_test (verification loops are normal)
                 if (len(self._recent_actions) >= 3
                     and len(set(self._recent_actions[-3:])) == 1
-                    and self._recent_actions[-1][0] not in ("inject_css", "inject_js", "run_test")):
+                    and self._recent_actions[-1][0] != "run_test"):
                     stuck_action = self._recent_actions[-1][0]
                     await self._log("status", f"⚠️ Loop detected — AI repeated '{stuck_action}' with same payload 3 times. Nudging to respond.")
                     self._recent_actions.clear()
@@ -381,46 +326,67 @@ class Brain:
                 self.messages.append({"role": "assistant", "content": full_raw_response})
 
             except Exception as e:
-                await self._log("status", f"AI API error after retries: {e}")
-                await self._log("status", "All retry attempts exhausted for this turn. Moving to next turn...")
+                self._consecutive_errors += 1
+                await self._log("status", f"AI API error: {e}")
+
+                # Circuit breaker — stop after 3 consecutive non-retryable errors
+                if self._consecutive_errors >= 3:
+                    await self._log("status", "❌ 3 consecutive API errors. Ending session to prevent infinite loop.")
+                    break
+
+                await self._log("status", f"Retrying next turn... ({self._consecutive_errors}/3 consecutive errors)")
                 await asyncio.sleep(2)
                 continue
 
             # --- Handle post_message (AI speaking to user) ---
             if action in ("post_message", "answer_user"):
-                self._recent_actions.clear()  # Reset loop detection — AI is communicating
+                self._recent_actions.clear()
                 message = payload.get("message", payload.get("text", ""))
                 await self._log("agent_message", message)
 
-                # If fix was delivered, update convo logger
-                if any(kw in message.lower() for kw in ["root cause", "fix", "verified", "resolved"]):
+                # Smarter resolved detection — avoid false positives on negated statements
+                msg_lower = message.lower()
+                positive_fix_signals = (
+                    ("root cause" in msg_lower and "could not" not in msg_lower and "unable" not in msg_lower)
+                    or ("verified" in msg_lower and "not verified" not in msg_lower)
+                    or ("fix" in msg_lower and "applied" in msg_lower)
+                    or ("resolved" in msg_lower and "not resolved" not in msg_lower and "unresolved" not in msg_lower)
+                )
+                if positive_fix_signals:
                     self.convo.mark_resolved()
 
                 # Wait for user input
-                if self.input_queue:
-                    user_input = await self.input_queue.get()
-                else:
-                    user_input = input("\n[You] > ").strip()
+                user_input = input("\n[You] > ").strip()
 
-                # Handle 'copy' command — copy last fix code to clipboard
+                # Handle 'copy' command
                 if user_input.lower() == "copy":
                     if self._last_fix_code:
                         result = copy_fix_to_clipboard(self._last_fix_code, "Fix code")
                         console.print(f"[bold cyan]{result}[/bold cyan]")
                     else:
                         console.print("[dim]No fix code available to copy.[/dim]")
-                    # Re-prompt — don't send 'copy' to the AI
-                    if self.input_queue:
-                        user_input = await self.input_queue.get()
-                    else:
-                        user_input = input("\n[You] > ").strip()
+                    user_input = input("\n[You] > ").strip()
 
-                if user_input.lower() in ("yes", "looks good", "all good", "done", "close"):
+                if self._is_close_input(user_input):
+                    # Auto-log fix to KB if fixes were applied
+                    try:
+                        if self.convo.fixes:
+                            entry = self._build_fix_entry()
+                            result = append_fix(entry)
+                            if result.get("success"):
+                                await self._log("status", "📝 Fix logged to knowledge base")
+                            else:
+                                await self._log("status", f"⚠️ Could not log fix: {result.get('error', 'unknown')}")
+                    except Exception as e:
+                        await self._log("status", f"⚠️ KB logging error: {e}")
                     await self._log("status", "Session complete!")
                     break
                 else:
                     self.messages.append({"role": "user", "content": user_input})
-                    obs = await capture_observation(self.browser)
+                    try:
+                        obs = await capture_observation(self.browser)
+                    except Exception:
+                        obs = {"dom": "", "console": "", "network": "", "screenshot_base64": "", "url": "unknown"}
                     self._write_scratch_files(obs)
                     self._persist_network_bodies()
                     slim_obs = self._build_slim_observation(obs)
@@ -441,12 +407,10 @@ class Brain:
             # --- Handle browser actions ---
             if action in ("inject_js", "inject_css"):
                 self._record_fix_attempt(action_data)
-                # Store the fix code for manual clipboard copy
                 fix_code = payload.get("code") or payload.get("css") or ""
                 if fix_code:
                     self._last_fix_code = fix_code
-                    self._fix_copy_offered = False  # New fix — allow hint to show again
-                # Also log fix to convo logger
+                    self._fix_copy_offered = False
                 self.convo.record_fix({
                     "turn": self.turn_count,
                     "action": action,
@@ -462,7 +426,10 @@ class Brain:
             else:
                 await asyncio.sleep(1.5)
 
-            obs = await capture_observation(self.browser)
+            try:
+                obs = await capture_observation(self.browser)
+            except Exception:
+                obs = {"dom": "", "console": "", "network": "", "screenshot_base64": "", "url": "unknown"}
             self._write_scratch_files(obs)
             self._persist_network_bodies()
             slim_obs = self._build_slim_observation(obs)
@@ -470,7 +437,6 @@ class Brain:
             context = self._build_observation_message(slim_obs, result, obs["url"])
             self.messages.append({"role": "user", "content": context})
             current_screenshot = obs["screenshot_base64"]
-
 
         # Save conversation at end of loop
         self._save_convo_sync()
@@ -483,7 +449,6 @@ class Brain:
             result = cross_reference_diagnostics()
             self.detected_scenario = result.get("detected_scenario", "")
             self.diagnosis_hints = result.get("potential_issues", [])
-            # Update convo logger with scenario info
             self.convo.set_scenario(self.detected_scenario)
             self.convo.set_diagnosis_hints(self.diagnosis_hints)
             return result
@@ -509,11 +474,20 @@ class Brain:
             return {"found": False, "error": f"Session file not found: {filename}"}
         elif action == "log_fix":
             entry = payload.get("entry", "")
-            # If AI sent empty/short entry, auto-build from session data
             if not entry or len(entry.strip()) < 10:
                 entry = self._build_fix_entry()
             return append_fix(entry)
         return {"error": f"Unknown local action: {action}"}
+
+    @staticmethod
+    def _safe_json_truncate(obj: dict, max_chars: int) -> str:
+        """Serialize JSON and truncate safely without producing invalid JSON.
+        Truncates at the serialized string level, not mid-object."""
+        full = json.dumps(obj, indent=2)
+        if len(full) <= max_chars:
+            return full
+        # Truncate and close with a note
+        return full[:max_chars] + '\n... [truncated]'
 
     def _build_context_message(self, slim_obs: dict, query: str, url: str) -> str:
         """Build the initial context message for the AI."""
@@ -533,7 +507,6 @@ class Brain:
         if relevant:
             context["relevant_fixes"] = relevant
 
-        # Auto-search past conversations for relevant context
         past_sessions = search_conversations(query)
         if not past_sessions and url:
             from urllib.parse import urlparse
@@ -543,10 +516,11 @@ class Brain:
         if past_sessions:
             context["past_sessions"] = past_sessions
 
+        context_json = self._safe_json_truncate(context, 8000)
         if self.multimodal:
-            return f"Current page state:\n```json\n{json.dumps(context, indent=2)[:8000]}\n```\n\nThe screenshot is attached as an image. LOOK AT IT and describe what you see."
+            return f"Current page state:\n```json\n{context_json}\n```\n\nThe screenshot is attached as an image. LOOK AT IT and describe what you see."
         else:
-            return f"Current page state:\n```json\n{json.dumps(context, indent=2)[:8000]}\n```\n\nNo screenshot available (text-only mode). Analyze the DOM, console, and network data. Use search_dom, inspect_element, and run_test to investigate."
+            return f"Current page state:\n```json\n{context_json}\n```\n\nNo screenshot available (text-only mode). Analyze the DOM, console, and network data. Use search_dom, inspect_element, and run_test to investigate."
 
     def _build_observation_message(self, slim_obs: dict, action_result: str, url: str) -> str:
         """Build observation message after an action."""
@@ -565,10 +539,12 @@ class Brain:
             }
         if relevant:
             context["relevant_fixes"] = relevant
+
+        context_json = self._safe_json_truncate(context, 8000)
         if self.multimodal:
-            return f"Observation after action:\n```json\n{json.dumps(context, indent=2)[:8000]}\n```\n\nFresh screenshot attached. LOOK AT IT and describe what changed."
+            return f"Observation after action:\n```json\n{context_json}\n```\n\nFresh screenshot attached. LOOK AT IT and describe what changed."
         else:
-            return f"Observation after action:\n```json\n{json.dumps(context, indent=2)[:8000]}\n```\n\nNo screenshot (text-only mode). Analyze the updated DOM/console/network data. Use inspect_element or run_test to verify changes."
+            return f"Observation after action:\n```json\n{context_json}\n```\n\nNo screenshot (text-only mode). Analyze the updated DOM/console/network data. Use inspect_element or run_test to verify changes."
 
     def _build_slim_observation(self, obs: dict) -> dict:
         """Build context-friendly slim observation."""
@@ -627,9 +603,7 @@ class Brain:
         """Write captured network response bodies to scratch/obs_net_bodies/ for read_network_body."""
         try:
             for url, body in self.browser.network_bodies.items():
-                # Create a safe filename from the URL
                 safe_name = re.sub(r'[^a-zA-Z0-9_\-.]', '_', url.split('?')[0].split('/')[-1] or 'index')
-                # Add a hash suffix to avoid collisions
                 url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
                 filename = f"{safe_name}_{url_hash}.txt"
                 filepath = os.path.join(SCRATCH_NET_BODIES, filename)
@@ -645,20 +619,21 @@ class Brain:
         from urllib.parse import urlparse
 
         date_str = datetime.now().strftime("%Y-%m-%d")
-        domain = urlparse(self.convo.url).netloc if self.convo.url else "unknown"
+        domain = "unknown"
+        try:
+            domain = urlparse(self.convo.url).netloc if self.convo.url else "unknown"
+        except Exception:
+            pass
         query = self.convo.query or "unknown"
 
-        # Gather fix details from recorded fixes
         fix_lines = []
         for fix in self.convo.fixes:
             action = fix.get("action", "")
             payload = fix.get("payload", {})
             code = payload.get("code") or payload.get("css") or ""
-            thought = fix.get("thought", "")
             if code:
                 fix_lines.append(f"  [{action}] {code.strip()}")
 
-        # Build the last thought for root cause context
         last_thought = ""
         for fix in reversed(self.convo.fixes):
             t = fix.get("thought", "")
@@ -687,6 +662,10 @@ Verified: {'Yes' if self.convo.resolved else 'No'}"""
         })
 
     def _trim_history(self):
-        """Trim conversation history to keep within model limits."""
+        """Trim conversation history to keep within model limits.
+        Always preserves the first message (original query + page context)."""
         if len(self.messages) > self.config.max_history:
-            self.messages = self.messages[-self.config.max_history:]
+            # Keep first message (original context) + most recent messages
+            first_msg = self.messages[0]
+            recent = self.messages[-(self.config.max_history - 1):]
+            self.messages = [first_msg] + recent

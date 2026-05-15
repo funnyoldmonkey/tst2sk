@@ -27,12 +27,21 @@ async def execute_action(browser: BrowserController, action: str, payload: dict)
                 return f"[error] type: selector not found — \"{selector}\""
             await el.focus()
             await el.fill(text)
+            # Dispatch input/change events for React/Angular/Vue compatibility
+            await page.evaluate("""(sel) => {
+                const el = document.querySelector(sel);
+                if (el) {
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            }""", selector)
             return f"Typed into: {selector}"
 
         elif action == "scroll":
-            x = payload.get("x", 0)
-            y = payload.get("y", 0)
-            await page.evaluate(f"window.scrollBy({x}, {y})")
+            x = int(payload.get("x", 0))
+            y = int(payload.get("y", 0))
+            # Parameterized evaluation — prevents JS injection via payload
+            await page.evaluate("([x, y]) => window.scrollBy(x, y)", [x, y])
             return f"Scrolled by ({x}, {y})"
 
         elif action == "hover":
@@ -47,7 +56,7 @@ async def execute_action(browser: BrowserController, action: str, payload: dict)
             url = payload["url"]
             browser.console_logs.clear()
             browser.network_log.clear()
-            await page.goto(url, wait_until="networkidle", timeout=30000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             return f"Navigated to: {url}"
 
         elif action == "inject_js":
@@ -99,23 +108,17 @@ async def execute_action(browser: BrowserController, action: str, payload: dict)
         elif action == "run_test":
             code = payload.get("code", "")
             wrapped = f"(function(){{ try {{ {code}\n return {{ success: true, message: 'Test Passed' }}; }} catch(e) {{ return {{ success: false, message: e.message }}; }} }})()"
-            result = await page.evaluate(wrapped)
+            # 10-second timeout prevents infinite loops in test code
+            import asyncio as _asyncio
+            try:
+                result = await _asyncio.wait_for(page.evaluate(wrapped), timeout=10.0)
+            except _asyncio.TimeoutError:
+                result = {"success": False, "message": "Test timed out after 10 seconds"}
             browser.console_logs.append(f">>> TEST_RESULT: {result}")
             return f"run_test: {result}"
 
         elif action == "observe":
-            # No action — just triggers a new observation on the next loop iteration
             return "observe requested — fresh observation coming"
-
-        elif action == "get_network_body":
-            url_query = payload.get("url", "")
-            # Search accumulated bodies
-            for stored_url, body in browser.network_bodies.items():
-                if url_query in stored_url:
-                    browser.console_logs.append(f">>> NETWORK_BODY [{url_query}]: {body[:5000]}")
-                    return f"Network body retrieved for {url_query}"
-            browser.console_logs.append(f">>> NETWORK_BODY [{url_query}]: NOT_FOUND")
-            return f"Network body not found for {url_query}"
 
         elif action == "clear_site_data":
             await browser.page.context.clear_cookies()
@@ -139,12 +142,12 @@ async def execute_action(browser: BrowserController, action: str, payload: dict)
             screenshot_bytes = await page.screenshot(full_page=False, type="png")
             img = Image.open(io.BytesIO(screenshot_bytes))
             dpr = result.get("dpr", 1) or 1
-            x = int(result["x"] * dpr)
-            y = int(result["y"] * dpr)
+            x = max(0, int(result["x"] * dpr))
+            y = max(0, int(result["y"] * dpr))
             x2 = min(img.width, x + int(result["w"] * dpr))
             y2 = min(img.height, y + int(result["h"] * dpr))
             if x2 > x and y2 > y:
-                cropped = img.crop((x, max(0, y), x2, y2))
+                cropped = img.crop((x, y, x2, y2))
                 crop_path = "scratch/element_capture.png"
                 cropped.save(crop_path, "PNG")
                 browser.console_logs.append(
@@ -160,12 +163,10 @@ async def execute_action(browser: BrowserController, action: str, payload: dict)
             return f"Clicked at position ({x}, {y})"
 
         elif action == "post_message" or action == "answer_user":
-            # The AI is speaking to the user — we just display it
             message = payload.get("message", payload.get("text", ""))
             return f"MESSAGE_TO_USER: {message}"
 
         elif action == "log_fix":
-            # Handled by the engine, not the browser
             return "log_fix handled by engine"
 
         else:

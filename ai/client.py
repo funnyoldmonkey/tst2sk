@@ -2,7 +2,6 @@
 import json
 import asyncio
 import logging
-from typing import Optional, Callable, Awaitable
 from openai import AsyncOpenAI
 from rich.console import Console
 from rich.text import Text
@@ -28,34 +27,18 @@ class AIClient:
             default_headers=config.extra_headers if config.extra_headers else None,
         )
         self.model = config.model
-        # Optional callback for retry status: async fn(message: str)
-        self.on_retry: Optional[Callable[[str], Awaitable[None]]] = None
 
     async def _countdown(self, delay: int, attempt: int, error_msg: str):
-        """Count down with live updates: 3... 2... 1... retry!
-
-        Uses Rich Live display for smooth single-line countdown in CLI.
-        Falls back to on_retry callback for Web UI mode.
-        """
+        """Count down with live updates using Rich Live display."""
         short_err = str(error_msg).split(" - ")[0][:80] if error_msg else "Unknown error"
 
-        if self.on_retry:
-            # Web UI mode — send status through callback
-            await self.on_retry(f"⚠️  API error (attempt {attempt}/{MAX_RETRIES}): {short_err}")
+        from rich.live import Live
+        _console.print(f"  [yellow]⚠️  API error (attempt {attempt}/{MAX_RETRIES}): {short_err}[/yellow]")
+        with Live(Text(f"  ⏳ Retrying in {delay}s...", style="dim"), console=_console, refresh_per_second=2) as live:
             for remaining in range(delay, 0, -1):
-                await self.on_retry(f"⏳ Retrying in {remaining}s...")
+                live.update(Text(f"  ⏳ Retrying in {remaining}s...", style="dim"))
                 await asyncio.sleep(1)
-            await self.on_retry(f"🔄 Retry {attempt + 1}/{MAX_RETRIES}...")
-        else:
-            # CLI mode — use Rich Live for smooth in-place countdown
-            from rich.live import Live
-            _console.print(f"  [yellow]⚠️  API error (attempt {attempt}/{MAX_RETRIES}): {short_err}[/yellow]")
-            with Live(Text(f"  ⏳ Retrying in {delay}s...", style="dim"), console=_console, refresh_per_second=2) as live:
-                for remaining in range(delay, 0, -1):
-                    live.update(Text(f"  ⏳ Retrying in {remaining}s...", style="dim"))
-                    await asyncio.sleep(1)
-                live.update(Text(f"  🔄 Retry {attempt + 1}/{MAX_RETRIES}...", style="bold cyan"))
-            # Live context exits, line is finalized
+            live.update(Text(f"  🔄 Retry {attempt + 1}/{MAX_RETRIES}...", style="bold cyan"))
 
     def _build_api_messages(
         self,
@@ -63,7 +46,7 @@ class AIClient:
         messages: list[dict],
         screenshot_base64: str | None = None,
     ) -> list[dict]:
-        """Build the messages array for the API call (shared by both methods)."""
+        """Build the messages array for the API call."""
         api_messages = [{"role": "system", "content": system_prompt}]
         for msg in messages:
             api_messages.append(msg)
@@ -89,6 +72,26 @@ class AIClient:
         return api_messages
 
     @staticmethod
+    def _is_retryable(e: Exception) -> bool:
+        """Check if an exception is retryable (rate limit, server error, timeout)."""
+        error_str = str(e).lower()
+        status = getattr(e, "status_code", None) or getattr(e, "code", None)
+
+        return (
+            status in (429, 500, 502, 503, 529)
+            or isinstance(e, (asyncio.TimeoutError, TimeoutError))
+            or "rate" in error_str
+            or "overloaded" in error_str
+            or "500" in error_str
+            or "503" in error_str
+            or "429" in error_str
+            or "quota" in error_str
+            or "capacity" in error_str
+            or "timeout" in error_str
+            or "timed out" in error_str
+        )
+
+    @staticmethod
     def _parse_json_response(raw_text: str) -> dict:
         """Extract JSON action from raw AI response text.
 
@@ -96,8 +99,11 @@ class AIClient:
         1. Standard fenced JSON block (```json ... ```)
         2. Any fenced block (``` ... ```)
         3. First { ... } in the raw text
-        4. Regex extraction of action/thought/payload from garbled text
+        4. Scan for any JSON object with "action" key
+        5. Regex extraction of action/thought/payload from garbled text
         """
+        import re
+
         # Strategy 1-3: Extract JSON from common wrappers
         json_text = raw_text
         if "```json" in json_text:
@@ -116,14 +122,11 @@ class AIClient:
             pass
 
         # Strategy 4: Try to find ANY valid JSON object in the raw text
-        # (handles cases where XML tags or other text wraps a JSON block)
-        import re
         json_blocks = re.findall(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', raw_text)
         for block in json_blocks:
             try:
                 parsed = json.loads(block)
                 if "action" in parsed:
-                    # Extract thought from XML tags if present in raw text
                     if not parsed.get("thought"):
                         thought_match = re.search(r'<thought>(.*?)</thought>', raw_text, re.DOTALL)
                         if thought_match:
@@ -133,7 +136,6 @@ class AIClient:
                 continue
 
         # Strategy 5: Regex extraction from completely garbled response
-        # Try to salvage the intended action and thought
         thought = ""
         action = "observe"
         payload = {}
@@ -152,31 +154,71 @@ class AIClient:
         if action_match:
             action = action_match.group(1)
 
-        # Extract message payload for post_message/answer_user
+        # Extract payload based on action type — covers ALL 26 actions
         if action in ("post_message", "answer_user"):
             msg_match = re.search(r'"message"\s*:\s*"(.*?)(?:"\s*[,}]|$)', raw_text, re.DOTALL)
             if msg_match:
                 payload = {"message": msg_match.group(1).strip()}
 
-        # Extract code/css payload for inject actions
         elif action in ("inject_css", "inject_js"):
             code_key = "css" if action == "inject_css" else "code"
             code_match = re.search(rf'"{code_key}"\s*:\s*"(.*?)(?:"\s*[,}}]|$)', raw_text, re.DOTALL)
             if code_match:
                 payload = {code_key: code_match.group(1).strip()}
 
-        # Extract selector for click/type/inspect/hover
-        elif action in ("click", "type", "hover", "inspect_element"):
+        elif action in ("click", "type", "hover", "inspect_element", "capture_element"):
             sel_match = re.search(r'"selector"\s*:\s*"(.*?)(?:"|$)', raw_text)
             if sel_match:
                 payload = {"selector": sel_match.group(1).strip()}
+            if action == "type":
+                text_match = re.search(r'"text"\s*:\s*"(.*?)(?:"|$)', raw_text)
+                if text_match:
+                    payload["text"] = text_match.group(1).strip()
 
-        # Extract query for search actions
         elif action in ("search_dom", "search_console", "search_network",
                         "search_playbook", "search_fixes", "search_conversations"):
             q_match = re.search(r'"query"\s*:\s*"(.*?)(?:"|$)', raw_text)
             if q_match:
                 payload = {"query": q_match.group(1).strip()}
+
+        elif action == "scroll":
+            x_match = re.search(r'"x"\s*:\s*(-?\d+)', raw_text)
+            y_match = re.search(r'"y"\s*:\s*(-?\d+)', raw_text)
+            payload = {"x": int(x_match.group(1)) if x_match else 0,
+                       "y": int(y_match.group(1)) if y_match else 0}
+
+        elif action == "navigate":
+            url_match = re.search(r'"url"\s*:\s*"(.*?)(?:"|$)', raw_text)
+            if url_match:
+                payload = {"url": url_match.group(1).strip()}
+
+        elif action == "click_at_position":
+            x_match = re.search(r'"x"\s*:\s*(-?\d+)', raw_text)
+            y_match = re.search(r'"y"\s*:\s*(-?\d+)', raw_text)
+            payload = {"x": int(x_match.group(1)) if x_match else 0,
+                       "y": int(y_match.group(1)) if y_match else 0}
+
+        elif action == "run_test":
+            code_match = re.search(r'"code"\s*:\s*"(.*?)(?:"\s*[,}]|$)', raw_text, re.DOTALL)
+            if code_match:
+                payload = {"code": code_match.group(1).strip()}
+
+        elif action == "read_network_body":
+            fn_match = re.search(r'"filename"\s*:\s*"(.*?)(?:"|$)', raw_text)
+            if fn_match:
+                payload = {"filename": fn_match.group(1).strip()}
+
+        elif action == "get_conversation_detail":
+            fn_match = re.search(r'"filename"\s*:\s*"(.*?)(?:"|$)', raw_text)
+            if fn_match:
+                payload = {"filename": fn_match.group(1).strip()}
+
+        elif action == "log_fix":
+            entry_match = re.search(r'"entry"\s*:\s*"(.*?)(?:"\s*[,}]|$)', raw_text, re.DOTALL)
+            if entry_match:
+                payload = {"entry": entry_match.group(1).strip()}
+
+        # observe, clear_site_data, diagnose — no payload needed
 
         if not thought:
             thought = f"[JSON_PARSE_ERROR] Raw response: {raw_text}"
@@ -196,7 +238,7 @@ class AIClient:
         """Send context to AI model and get an action response.
 
         Retries up to MAX_RETRIES times with incremental backoff (3s, 6s, 9s, ...)
-        on server errors (5xx) and rate limits (429). Free-tier friendly.
+        on server errors (5xx), rate limits (429), and timeouts. Free-tier friendly.
         """
         api_messages = self._build_api_messages(system_prompt, messages, screenshot_base64)
 
@@ -218,76 +260,9 @@ class AIClient:
 
             except Exception as e:
                 last_error = e
-                error_str = str(e).lower()
-                status = getattr(e, "status_code", None) or getattr(e, "code", None)
 
-                # Retry on 429 (rate limit), 500, 502, 503, 529 — common free-tier errors
-                is_retryable = (
-                    status in (429, 500, 502, 503, 529)
-                    or "rate" in error_str
-                    or "overloaded" in error_str
-                    or "500" in error_str
-                    or "503" in error_str
-                    or "429" in error_str
-                    or "quota" in error_str
-                    or "capacity" in error_str
-                )
-
-                if is_retryable and attempt < MAX_RETRIES:
+                if self._is_retryable(e) and attempt < MAX_RETRIES:
                     delay = BASE_DELAY * attempt  # 3, 6, 9, 12, 15, 18, 21, 24, 27
-                    await self._countdown(delay, attempt, str(e))
-                    continue
-                else:
-                    raise last_error
-
-    async def stream_get_action(
-        self,
-        system_prompt: str,
-        messages: list[dict],
-        screenshot_base64: str | None = None,
-    ):
-        """Stream tokens from the AI model. Yields raw text chunks.
-
-        Retries up to MAX_RETRIES times with incremental backoff (3s, 6s, 9s, ...)
-        on server errors (5xx) and rate limits (429). Free-tier friendly.
-        """
-        api_messages = self._build_api_messages(system_prompt, messages, screenshot_base64)
-
-        last_error = None
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                response = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=api_messages,
-                    temperature=0.2,
-                    max_tokens=4096,
-                    stream=True,
-                )
-
-                async for chunk in response:
-                    content = chunk.choices[0].delta.content
-                    if content:
-                        yield content
-                return  # Stream completed successfully
-
-            except Exception as e:
-                last_error = e
-                error_str = str(e).lower()
-                status = getattr(e, "status_code", None) or getattr(e, "code", None)
-
-                is_retryable = (
-                    status in (429, 500, 502, 503, 529)
-                    or "rate" in error_str
-                    or "overloaded" in error_str
-                    or "500" in error_str
-                    or "503" in error_str
-                    or "429" in error_str
-                    or "quota" in error_str
-                    or "capacity" in error_str
-                )
-
-                if is_retryable and attempt < MAX_RETRIES:
-                    delay = BASE_DELAY * attempt
                     await self._countdown(delay, attempt, str(e))
                     continue
                 else:

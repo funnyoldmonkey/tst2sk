@@ -191,7 +191,7 @@ python main.py
 2. Describe the issue (or press Enter for a general investigation)
 3. Watch the AI work — you'll see thought panels, actions, and results in real time
 4. When the AI delivers a fix, type `copy` to copy the code to your clipboard
-5. Confirm with `yes`, `done`, or `close` to end the session — or give follow-up instructions
+5. Type `end` to close the session and auto-save fixes to the knowledge base — or give follow-up instructions
 
 ### Example Prompts
 
@@ -295,8 +295,9 @@ tst2sk/
 │  6. Loop back to step 1 with fresh observation              │
 │                                                             │
 │  Exit conditions:                                           │
-│  - User confirms fix ("yes", "done", "close")              │
-│  - AI escalates to the user after 3 failed fix attempts         │
+│  - User types "end" (auto-logs fixes to KB)                │
+│  - AI escalates to the user after 3 failed fix attempts    │
+│  - 3 consecutive API errors (circuit breaker)              │
 │  - User interrupts (Ctrl+C)                                │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -314,11 +315,86 @@ JS is allowed as a first attempt only for: disabled buttons, event handlers, for
 
 ### Knowledge Base
 
-Every verified fix can be logged to `kb/fixes.log`. The AI auto-searches this file at the start of each session, matching by URL domain, detected scenario, and diagnosis hints. Over time, the KB becomes a library of proven solutions that accelerates future investigations.
+When you type `end` to close a session, any fixes applied during that session are automatically logged to `kb/fixes.log`. The AI auto-searches this file at the start of each session, matching by URL domain, detected scenario, and diagnosis hints. Over time, the KB becomes a library of proven solutions that accelerates future investigations. Sessions closed via Ctrl+C or the circuit breaker save the transcript to `convo/` but do not write to the KB.
 
 ### Playbooks
 
-Drop fix recipes into `playbooks/PLAYBOOKS.md` using markdown headers (`# Recipe Name`). The AI searches playbooks by symptom keywords and uses matching recipes as guidance — not as blind orders. If its investigation reveals a different root cause than what the playbook describes, it trusts its investigation and pivots.
+Drop fix recipes into `playbooks/PLAYBOOKS.md`. The AI searches playbooks by symptom keywords and uses matching recipes as guidance — not as blind orders. If its investigation reveals a different root cause than what the playbook describes, it trusts its investigation and pivots.
+
+#### How playbook search works
+
+The search function (`search_playbook` in `engine/kb.py`) splits `PLAYBOOKS.md` into sections using the `# ` delimiter (top-level markdown header at the start of a line). Each `# Header` starts a new section. When the AI calls `search_playbook("opacity")`, it does a case-insensitive text search across all sections and returns up to 3 matching sections.
+
+#### Playbook format
+
+Each playbook entry must start with a top-level `# ` header. This is the section separator — everything from one `# ` header to the next is treated as one playbook entry. Use keywords in both the header and body that the AI would search for (symptom names, CSS properties, error messages, platform names).
+
+```markdown
+# Element Hidden by Opacity
+- Symptom: Element exists in DOM but is invisible on page.
+- Check: `getComputedStyle(el).opacity` returns `0` or near-zero.
+- Fix: `inject_css` with `opacity: 1 !important` on the target selector.
+- Verify: `run_test` checking `parseFloat(getComputedStyle(el).opacity) === 1`.
+
+# Shopify Add to Cart Button Disabled
+- Symptom: Add to Cart button is present but does not respond to clicks.
+- Check: Look for `disabled` attribute, `pointer-events: none`, or overlay elements blocking clicks.
+- Fix: Remove `disabled` attribute via `inject_js`, or remove overlay via `inject_css`/`inject_js`.
+- Verify: `run_test` checking `!el.disabled && getComputedStyle(el).pointerEvents !== 'none'`.
+
+# Popup or Modal Blocking Page
+- Symptom: A modal, popup, or overlay is covering the page and intercepting clicks.
+- Check: Search DOM for high z-index overlays, `position: fixed` elements, or known popup frameworks (Alia, Privy, Klaviyo, OptinMonster).
+- Fix: Remove the popup container via `inject_js` or hide it via `inject_css` with `display: none !important`.
+- Verify: Screenshot shows popup gone; `run_test` confirms target elements are now clickable.
+```
+
+**Rules:**
+- `# ` (hash + space) at the start of a line is the only separator. Do NOT use `---` or blank lines as separators between entries.
+- Subheadings (`##`, `###`) within a section are fine — they won't split the entry.
+- Include searchable keywords: symptom descriptions, CSS property names, platform names, error text.
+- Keep each entry self-contained — the AI receives only matching sections, not the whole file.
+- The AI gets a max of 3 matching sections per search to keep context lean.
+
+#### Adding a new playbook
+
+Open `playbooks/PLAYBOOKS.md` and append a new entry at the bottom. Copy this template:
+
+```markdown
+# [Short Descriptive Title with Keywords]
+- Platform: [Shopify / WordPress / WooCommerce / Any / etc.]
+- Symptom: [What the user sees or reports. Use words they would use.]
+- Check: [What to inspect — DOM selectors, computed styles, console errors, network calls.]
+- Root Cause: [Why this happens — the underlying technical reason.]
+- Fix: [Which action to use — inject_css, inject_js, or both. Include the actual code.]
+- Code:
+  ```js
+  // paste the fix code here
+  ```
+- Verify: [How to confirm the fix worked — run_test assertion, inspect_element check, or visual confirmation.]
+- Notes: [Optional. Edge cases, variations, or things to watch out for.]
+```
+
+**Real example** — paste this directly into your `PLAYBOOKS.md` to try it:
+
+```markdown
+# Shopify Product Price Hidden by App Conflict
+- Platform: Shopify
+- Symptom: Product price is missing or invisible on the product page.
+- Check: Search DOM for `.price` or `[class*=price]`. If element exists but has `[HIDDEN:opacity]` or `[HIDDEN:display]`, it's a visibility issue. Check console for errors from third-party apps (e.g., Bold, ReCharge, Discount Ninja).
+- Root Cause: A third-party pricing app injects CSS that hides the default price element, usually via `opacity: 0`, `display: none`, or `visibility: hidden`. When the app fails to load its replacement, the price disappears entirely.
+- Fix: Use `inject_css` to restore visibility on the price element.
+- Code:
+  ```css
+  .price, .price-item, [class*="price"] {
+    opacity: 1 !important;
+    display: block !important;
+    visibility: visible !important;
+  }
+  ```
+- Verify: `run_test` with `parseFloat(getComputedStyle(document.querySelector('.price')).opacity) === 1` and confirm price text is not empty.
+- Notes: If the price shows as $0.00 or wrong value after making it visible, the issue is data-level (variant JSON or Liquid), not CSS. Escalate to Level 2 (inject_js) to read the variant data from `window.ShopifyAnalytics.meta` or the product JSON.
+```
 
 ### Session Transcripts
 

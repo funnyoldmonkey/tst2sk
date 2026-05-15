@@ -1,5 +1,6 @@
 """Configuration for TST2SK."""
 import os
+import sys
 import json
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
@@ -53,7 +54,7 @@ class AppConfig:
             try:
                 headers = json.loads(raw_headers)
             except json.JSONDecodeError:
-                pass
+                print(f"⚠️  Warning: AI_EXTRA_HEADERS is not valid JSON — headers ignored.", file=sys.stderr)
         multimodal_raw = os.getenv("AI_MULTIMODAL_MODEL", "true").lower()
         return cls(
             api_key=os.getenv("AI_API_KEY", ""),

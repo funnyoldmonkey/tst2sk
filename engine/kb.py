@@ -19,6 +19,9 @@ def append_fix(entry_text: str) -> dict:
         return {"success": False, "error": "Entry is empty or too short. Provide a full fix entry with symptom, root cause, fix, and code."}
     ensure_kb_dir()
     try:
+        # Ensure entry starts with --- delimiter for consistent search_fixes splitting
+        if not cleaned.startswith("---"):
+            cleaned = "---\n" + cleaned
         with open(KB_FIXES_LOG, "a", encoding="utf-8") as f:
             f.write(cleaned + "\n")
         return {"success": True, "message": "Fix logged to kb/fixes.log"}
