@@ -29,7 +29,7 @@
 
 ## What is TST2SK?
 
-TST2SK is an autonomous AI-powered agent that investigates and fixes web page issues in real time. Point it at any URL, describe the problem, and it launches a browser, captures the full page state (DOM, console logs, network activity, screenshots), diagnoses the issue, applies fixes, verifies they work, and delivers the solution — all without human intervention.
+TST2SK is an autonomous AI-powered agent that investigates and fixes web page issues in real time. Point it at any URL, describe the problem, and it launches a browser, captures the full page state (DOM, console logs, network activity, screenshots), diagnoses the issue, applies fixes, verifies the work, and delivers the solution — all without human intervention.
 
 Built for Tier 2 support teams who deal with front-end issues on live sites — broken layouts, hidden elements, disabled buttons, CSS conflicts, JavaScript errors, failed API calls. TST2SK handles the investigation loop that would normally take a human 15-30 minutes of DevTools work.
 
@@ -46,7 +46,7 @@ Built for Tier 2 support teams who deal with front-end issues on live sites — 
 - **Playbooks** — drop fix recipes into `playbooks/PLAYBOOKS.md` and the AI will reference them during investigations.
 - **Smart retry logic** — incremental backoff (3s, 6s, 9s...) with live countdown for API rate limits and server errors. Free-tier friendly.
 - **Stuck-loop detection** — if the AI repeats the same action with the same payload 3 times, it gets nudged to communicate with the user.
-- **Robust JSON parsing** — 5-strategy parser handles malformed AI responses, XML-wrapped JSON, garbled text. Extracts intent even from broken output.
+- **Robust JSON parsing** — 5-strategy parser handles malformed AI responses, XML-wrapped JSON, and garbled text. Extracts intent even from broken output.
 - **Clean CLI experience** — thought panels, action icons, compact results, animated thinking spinner, markdown-rendered code blocks.
 - **Copy to clipboard** — type `copy` after any fix to copy the code to your clipboard.
 
@@ -63,7 +63,7 @@ You → describe the problem → TST2SK launches browser → captures page state
                                         ↓
                               Runs verification test (computed styles + visual check)
                                         ↓
-                              Fix verified? → Delivers solution with copyable code
+                              Fix verified? → Delivers a solution with copyable code
                               Not fixed?   → Tries different approach (up to 3 attempts)
                               Still broken? → Reports findings and asks for user input
 ```
@@ -78,7 +78,7 @@ You → describe the problem → TST2SK launches browser → captures page state
 ### Step 1: Clone the repository
 
 ```bash
-git clone https://github.com/your-username/tst2sk.git
+git clone https://github.com/funnyoldmonkey/tst2sk.git
 cd tst2sk
 ```
 
@@ -110,17 +110,17 @@ Configure your `.env`:
 ```env
 AI_API_KEY=your-google-api-key
 AI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
-AI_MODEL=gemma-4-27b-it
-AI_LLM_PROVIDER=Google API
+AI_MODEL=gemma-4-31b-it
+AI_LLM_PROVIDER=Google_API
 AI_MULTIMODAL_MODEL=true
 ```
 
 Recommended Google models:
 | Model | Vision | Notes |
 |-------|--------|-------|
-| `gemini-2.0-flash` | Yes | Fast, good for most tasks |
-| `gemini-2.5-flash-preview-05-20` | Yes | Latest, best reasoning |
-| `gemma-4-27b-it` | Yes | Smaller, works on free tier |
+| `gemini-3.1-flash-lite` | Yes | Fast, good for most tasks, works on free tier |
+| `gemma-4-31b-it` | Yes | Latest, best reasoning, works on free tier |
+| `gemma-4-29b-a4b-it` | Yes | Smaller, works on free tier |
 
 #### Option B: OpenRouter (Many models, pay-per-token)
 
@@ -134,17 +134,17 @@ Configure your `.env`:
 ```env
 AI_API_KEY=your-openrouter-api-key
 AI_BASE_URL=https://openrouter.ai/api/v1
-AI_MODEL=google/gemini-2.0-flash-001
+AI_MODEL=openrouter/free
 AI_LLM_PROVIDER=OpenRouter
-AI_MULTIMODAL_MODEL=true
+AI_MULTIMODAL_MODEL=false
 ```
 
 Recommended OpenRouter models:
 | Model | Vision | Notes |
 |-------|--------|-------|
-| `google/gemini-2.0-flash-001` | Yes | Fast and affordable |
-| `anthropic/claude-sonnet-4` | Yes | Strong reasoning |
-| `meta-llama/llama-4-maverick` | Yes | Open-source, capable |
+| `openrouter/free` | Yes | Fast and affordable |
+| `poolside/laguna-m.1:free` | Yes | Strong reasoning |
+| `openrouter/owl-alpha` | Yes | Open-source, capable |
 
 ### Step 5: Create your `.env` file
 
@@ -199,7 +199,7 @@ python main.py
 > The Add to Cart button is not responding when clicked. Fix it.
 
 **Styling changes:**
-> The product title font is too small. Make it 32px bold. Also make the Add to Cart button bright red with white text.
+> The product title font is too small. Make it 32px bold. Also, make the Add to Cart button bright red with white text.
 
 **Investigation only:**
 > Check if the page loads correctly and report what you see. Do not fix anything.
@@ -236,7 +236,7 @@ These interact with the page and trigger a fresh observation after execution.
 | `answer_user` | Alias for post_message |
 
 ### Search Actions
-These are instant lookups — no browser roundtrip needed.
+These are instant lookups — no browser round-trip needed.
 
 | Action | Description |
 |--------|-------------|
@@ -289,14 +289,14 @@ tst2sk/
 │                                                             │
 │  1. Capture observation (DOM + console + network + screenshot)
 │  2. Build slim context for AI (summaries + relevant KB fixes)
-│  3. Send to AI model with system prompt                      │
+│  3. Send to the AI model with the system prompt                      │
 │  4. Parse AI response → extract action                       │
 │  5. Execute action (browser or local search)                │
 │  6. Loop back to step 1 with fresh observation              │
 │                                                             │
 │  Exit conditions:                                           │
 │  - User confirms fix ("yes", "done", "close")              │
-│  - AI escalates to user after 3 failed fix attempts         │
+│  - AI escalates to the user after 3 failed fix attempts         │
 │  - User interrupts (Ctrl+C)                                │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -310,7 +310,7 @@ The AI follows a strict escalation protocol for fixes:
 3. **Level 3: DOM reconstruction** — Only if targeted fixes keep failing.
 4. **Level 4: User notification** — After 3 failed attempts, report findings and ask for help.
 
-JS is allowed as a first attempt only for: disabled buttons, event handlers, form logic, variant IDs, fetch/API calls, script re-initialization.
+JS is allowed as a first attempt only for: disabled buttons, event handlers, form logic, variant IDs, fetch/API calls, and script re-initialization.
 
 ### Knowledge Base
 
@@ -347,25 +347,7 @@ Contributions are welcome! Some areas that could use help:
 
 MIT License
 
-Copyright (c) 2025 Jall Fiel
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Copyright (c) 2026 Jall Fiel
 
 ---
 
