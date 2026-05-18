@@ -44,8 +44,10 @@ Built for Tier 2 support teams who deal with front-end issues on live sites — 
 - **Knowledge base** — logs verified fixes to `kb/fixes.log` and auto-searches past solutions for similar issues.
 - **Session memory** — full conversation transcripts saved to `convo/` with auto-generated tags. The AI searches past sessions for relevant context.
 - **Playbooks** — drop fix recipes into `playbooks/PLAYBOOKS.md` and the AI will reference them during investigations.
+- **API key round-robin** — supply multiple Google API keys (comma-separated in `.env`) and TST2SK rotates between them every N requests. On 429 rate limits, it immediately switches to the next key. Keeps free-tier sessions alive longer.
 - **Smart retry logic** — incremental backoff (3s, 6s, 9s...) with live countdown for API rate limits and server errors. Free-tier friendly.
 - **Stuck-loop detection** — if the AI repeats the same action with the same payload 3 times, it gets nudged to communicate with the user.
+- **Multi-line paste** — paste multi-line code or logs into the CLI prompt. Buffered input is drained automatically; press Enter on a blank line to submit.
 - **Robust JSON parsing** — 5-strategy parser handles malformed AI responses, XML-wrapped JSON, and garbled text. Extracts intent even from broken output.
 - **Clean CLI experience** — thought panels, action icons, compact results, animated thinking spinner, markdown-rendered code blocks.
 - **Copy to clipboard** — type `copy` after any fix to copy the code to your clipboard.
@@ -108,12 +110,14 @@ TST2SK works with any OpenAI-compatible API. Here are setup instructions for the
 
 Configure your `.env`:
 ```env
-AI_API_KEY=your-google-api-key
+AI_API_KEY_GOOGLE=your-key-1,your-key-2,your-key-3
 AI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
 AI_MODEL=gemma-4-31b-it
 AI_LLM_PROVIDER=Google_API
 AI_MULTIMODAL_MODEL=true
+AI_ROUND_ROBIN_SWITCH=3
 ```
+Multiple comma-separated keys enable round-robin rotation (see [Configuration](#configuration)).
 
 Recommended Google models:
 | Model | Vision | Notes |
@@ -132,7 +136,7 @@ Recommended Google models:
 
 Configure your `.env`:
 ```env
-AI_API_KEY=your-openrouter-api-key
+AI_API_KEY_OPENROUTER=your-openrouter-api-key
 AI_BASE_URL=https://openrouter.ai/api/v1
 AI_MODEL=openrouter/free
 AI_LLM_PROVIDER=OpenRouter
@@ -152,9 +156,19 @@ Recommended OpenRouter models:
 cp .env.example .env
 ```
 
-Edit `.env` with your API key and model choice.
+Edit `.env` and add your API key(s) under the correct provider variable (`AI_API_KEY_GOOGLE`, `AI_API_KEY_OPENROUTER`, or `AI_API_KEY_LMSTUDIO`).
 
-### Step 6: Run
+### Step 6: Run the setup wizard
+
+```bash
+python setup.py
+```
+
+Or on Windows, double-click `Setup TST2SK.bat`.
+
+The setup wizard lets you pick a provider, model, and mode interactively. It tests your API key(s) before saving. You can re-run it any time to switch providers or models. It does not touch your API keys — those are always edited directly in `.env`.
+
+### Step 7: Run
 
 ```bash
 python main.py
@@ -164,16 +178,37 @@ Or on Windows, double-click `Run TST2SK.bat`.
 
 ## Configuration
 
-All configuration is done through the `.env` file:
+All configuration is done through the `.env` file. Use `python setup.py` (or `Setup TST2SK.bat`) to switch providers and models interactively — API keys are always edited directly in `.env`.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `AI_API_KEY` | Yes | Your API key |
-| `AI_BASE_URL` | Yes | API endpoint URL |
-| `AI_MODEL` | Yes | Model name/ID |
-| `AI_LLM_PROVIDER` | No | Display name shown in CLI (e.g., "Google API") |
+| `AI_API_KEY_GOOGLE` | Per provider | Google API key(s), comma-separated for round-robin |
+| `AI_API_KEY_OPENROUTER` | Per provider | OpenRouter API key |
+| `AI_API_KEY_LMSTUDIO` | Per provider | LMStudio API key (default: `lm-studio`) |
+| `AI_LLM_PROVIDER` | Yes | Active provider: `Google_API`, `OpenRouter`, or `Local_(LMStudio)` |
+| `AI_BASE_URL` | Yes | API endpoint URL (set by setup wizard) |
+| `AI_MODEL` | Yes | Model name/ID (set by setup wizard) |
 | `AI_MULTIMODAL_MODEL` | No | `true` for vision models, `false` for text-only (default: `true`) |
+| `AI_ROUND_ROBIN_SWITCH` | No | Rotate API key every N requests — Google only (default: `3`) |
 | `AI_EXTRA_HEADERS` | No | JSON string of extra HTTP headers for custom providers |
+
+### API Key Round-Robin (Google)
+
+Google's free tier has per-key rate limits (15 RPM). If you have multiple API keys, add them comma-separated:
+
+```env
+AI_API_KEY_GOOGLE=key-aaa,key-bbb,key-ccc
+AI_ROUND_ROBIN_SWITCH=3
+```
+
+TST2SK rotates to the next key every 3 requests (configurable). If any key hits a 429 rate limit, it immediately rotates to the next key before retrying. The CLI shows rotation events:
+
+```
+🔄 Key rotated (scheduled): key 1 → 2/3
+🔄 Key rotated (429 rate limit): key 2 → 3/3
+```
+
+Round-robin only applies to Google with multiple keys. OpenRouter and LMStudio use a single key and skip rotation entirely.
 
 ### Vision vs Text-Only Mode
 
@@ -191,7 +226,8 @@ python main.py
 2. Describe the issue (or press Enter for a general investigation)
 3. Watch the AI work — you'll see thought panels, actions, and results in real time
 4. When the AI delivers a fix, type `copy` to copy the code to your clipboard
-5. Type `end` to close the session and auto-save fixes to the knowledge base — or give follow-up instructions
+5. Paste multi-line content (code snippets, error logs) directly — the CLI handles buffered input and waits for a blank line to submit
+6. Type `end` to close the session and auto-save fixes to the knowledge base — or give follow-up instructions
 
 ### Example Prompts
 
@@ -256,7 +292,8 @@ These are instant lookups — no browser round-trip needed.
 ```
 tst2sk/
 ├── main.py                 # Entry point — CLI interface, startup display
-├── config.py               # Configuration from .env
+├── config.py               # Configuration from .env (provider keys, round-robin)
+├── setup.py                # Interactive setup wizard — switch provider, model, mode
 ├── ai/
 │   ├── client.py           # OpenAI-compatible API client with retry logic
 │   └── prompts.py          # System prompts (multimodal + text-only variants)
@@ -278,7 +315,8 @@ tst2sk/
 ├── .env                    # Your configuration (not tracked in git)
 ├── .env.example            # Configuration template
 ├── requirements.txt        # Python dependencies
-└── Run TST2SK.bat          # Windows launcher
+├── Run TST2SK.bat          # Windows launcher
+└── Setup TST2SK.bat        # Windows launcher for setup wizard
 ```
 
 ### The Agent Loop
@@ -405,7 +443,7 @@ Every session is saved to `convo/` as a JSON file with auto-generated tags (site
 
 **Empty AI responses or crashes on Turn 1** — Your model may be too small for the observation payload. Try a larger model or switch to text-only mode (`AI_MULTIMODAL_MODEL=false`) to reduce payload size.
 
-**Retries keep firing (429/500 errors)** — You're hitting rate limits. The app retries automatically with incremental backoff. If using free-tier APIs, this is normal during peak hours.
+**Retries keep firing (429/500 errors)** — You're hitting rate limits. The app retries automatically with incremental backoff. If using Google's free tier, add multiple API keys to `.env` (comma-separated under `AI_API_KEY_GOOGLE`) to enable round-robin rotation and spread the load across keys.
 
 **"Playwright browsers not installed"** — Run `playwright install chromium`.
 

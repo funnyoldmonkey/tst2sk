@@ -1,6 +1,7 @@
 """The agent brain — observe, think, act, repeat. CLI-only."""
 import os
 import re
+import sys
 import json
 import time
 import hashlib
@@ -39,10 +40,22 @@ LOCAL_ACTIONS = {
 _CLOSE_KEYWORD = "end"
 
 
+def _has_buffered_input() -> bool:
+    """Check if stdin has buffered data (from a paste operation)."""
+    if sys.platform == "win32":
+        import msvcrt
+        return msvcrt.kbhit()
+    else:
+        import select as _select
+        return bool(_select.select([sys.stdin], [], [], 0.02)[0])
+
+
 def _read_multiline_input(prompt: str = "\n[You] > ") -> str:
     """Read user input with multi-line paste support.
 
-    Reads lines until the user submits an empty line (just hits Enter).
+    Phase 1: Drain all buffered stdin (pasted text, including blank lines).
+    Phase 2: Show continuation prompt. Blank line = submit, but only when
+             nothing is left in the buffer.
     Quick commands ('end', 'copy') submit immediately on a single line.
     """
     first_line = input(prompt)
@@ -52,13 +65,25 @@ def _read_multiline_input(prompt: str = "\n[You] > ") -> str:
     if stripped in (_CLOSE_KEYWORD, "copy", ""):
         return first_line.strip()
 
-    # Multi-line mode: keep reading until blank line
     lines = [first_line]
+
+    # Phase 1: Drain any buffered input from paste (including blank lines)
+    while _has_buffered_input():
+        try:
+            line = sys.stdin.readline()
+            if not line:  # EOF
+                break
+            lines.append(line.rstrip("\n\r"))
+        except Exception:
+            break
+
+    # Phase 2: Let user add more or submit with blank line
     while True:
         try:
             line = input("  ... ")
-            if line.strip() == "":
-                break  # Blank line = submit
+            # Blank line = submit ONLY if buffer is empty (user actually hit Enter)
+            if line.strip() == "" and not _has_buffered_input():
+                break
             lines.append(line)
         except EOFError:
             break

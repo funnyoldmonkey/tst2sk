@@ -74,9 +74,10 @@ async def main():
 
     # 1. Configuration
     config = AppConfig.from_env()
-    if not config.api_key:
-        console.print("\n[bold red]Error: AI_API_KEY not found in .env file.[/bold red]")
-        console.print("Please create a .env file based on .env.example")
+    if not config.api_keys:
+        provider = os.getenv("AI_LLM_PROVIDER", "")
+        console.print(f"\n[bold red]Error: No API key found for provider '{provider}'.[/bold red]")
+        console.print("Run [bold cyan]Setup TST2SK.bat[/bold cyan] or add your key to .env")
         return
     if not config.base_url:
         console.print("\n[bold red]Error: AI_BASE_URL not found in .env file.[/bold red]")
@@ -91,13 +92,19 @@ async def main():
     provider = os.getenv("AI_LLM_PROVIDER", "Unknown")
     model = config.model
     mode = "Multimodal (Vision)" if config.multimodal else "Text-Only"
+    key_count = len(config.api_keys)
     info_block = Text()
     info_block.append(f"Provider : ", style="dim")
     info_block.append(f"{provider}\n", style="bold white")
     info_block.append(f"Model    : ", style="dim")
     info_block.append(f"{model}\n", style="bold white")
     info_block.append(f"Mode     : ", style="dim")
-    info_block.append(f"{mode}", style="bold white")
+    info_block.append(f"{mode}\n", style="bold white")
+    info_block.append(f"Keys     : ", style="dim")
+    if key_count > 1:
+        info_block.append(f"{key_count} (round-robin every {config.round_robin_switch} req)", style="bold white")
+    else:
+        info_block.append(f"{key_count}", style="bold white")
     console.print()
     console.print(Align.center(info_block))
 

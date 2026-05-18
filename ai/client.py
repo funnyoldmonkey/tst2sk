@@ -21,12 +21,46 @@ class AIClient:
 
     def __init__(self, config: AppConfig):
         self.config = config
-        self.client = AsyncOpenAI(
-            api_key=config.api_key,
-            base_url=config.base_url,
-            default_headers=config.extra_headers if config.extra_headers else None,
-        )
         self.model = config.model
+
+        # Round-robin state (Google only, multiple keys)
+        self._api_keys = config.api_keys if config.api_keys else [config.api_key]
+        self._current_key_index = 0
+        self._request_count = 0
+        self._rr_switch = config.round_robin_switch  # rotate every N requests
+        self._rr_enabled = len(self._api_keys) > 1
+
+        # Build initial client with first key
+        self.client = self._build_client(self._api_keys[self._current_key_index])
+
+        if self._rr_enabled:
+            _console.print(f"  [dim]🔑 Round-robin: {len(self._api_keys)} keys, rotate every {self._rr_switch} requests[/dim]")
+
+    def _build_client(self, api_key: str) -> AsyncOpenAI:
+        """Create an AsyncOpenAI client with the given key."""
+        return AsyncOpenAI(
+            api_key=api_key,
+            base_url=self.config.base_url,
+            default_headers=self.config.extra_headers if self.config.extra_headers else None,
+        )
+
+    def _rotate_key(self, reason: str = "scheduled"):
+        """Rotate to the next API key."""
+        if not self._rr_enabled:
+            return
+        old_idx = self._current_key_index
+        self._current_key_index = (self._current_key_index + 1) % len(self._api_keys)
+        self.client = self._build_client(self._api_keys[self._current_key_index])
+        self._request_count = 0
+        _console.print(f"  [dim]🔄 Key rotated ({reason}): key {old_idx + 1} → {self._current_key_index + 1}/{len(self._api_keys)}[/dim]")
+
+    def _maybe_rotate_scheduled(self):
+        """Rotate key if we've hit the request threshold."""
+        if not self._rr_enabled:
+            return
+        self._request_count += 1
+        if self._request_count >= self._rr_switch:
+            self._rotate_key("scheduled")
 
     async def _countdown(self, delay: int, attempt: int, error_msg: str):
         """Count down with live updates using Rich Live display."""
@@ -245,6 +279,9 @@ class AIClient:
         last_error = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
+                # Scheduled rotation before each request
+                self._maybe_rotate_scheduled()
+
                 response = await self.client.chat.completions.create(
                     model=self.model,
                     messages=api_messages,
@@ -262,6 +299,16 @@ class AIClient:
                 last_error = e
 
                 if self._is_retryable(e) and attempt < MAX_RETRIES:
+                    # On 429, immediately rotate key before retrying
+                    is_rate_limit = (
+                        getattr(e, "status_code", None) == 429
+                        or "429" in str(e)
+                        or "rate" in str(e).lower()
+                        or "quota" in str(e).lower()
+                    )
+                    if is_rate_limit and self._rr_enabled:
+                        self._rotate_key("429 rate limit")
+
                     delay = BASE_DELAY * attempt  # 3, 6, 9, 12, 15, 18, 21, 24, 27
                     await self._countdown(delay, attempt, str(e))
                     continue
