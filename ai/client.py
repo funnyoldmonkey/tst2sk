@@ -252,7 +252,17 @@ class AIClient:
             if entry_match:
                 payload = {"entry": entry_match.group(1).strip()}
 
-        # observe, clear_site_data, diagnose — no payload needed
+        elif action == "cdp_get_dom_tree":
+            depth_match = re.search(r'"depth"\s*:\s*(\d+)', raw_text)
+            if depth_match:
+                payload = {"depth": int(depth_match.group(1))}
+
+        elif action in ("cdp_get_computed_style", "cdp_query_selector_all"):
+            sel_match = re.search(r'"selector"\s*:\s*"(.*?)(?:"|$)', raw_text)
+            if sel_match:
+                payload = {"selector": sel_match.group(1).strip()}
+
+        # observe, clear_site_data, diagnose, cdp_get_cookies, cdp_get_page_metrics — no payload needed
 
         if not thought:
             thought = f"[JSON_PARSE_ERROR] Raw response: {raw_text}"
