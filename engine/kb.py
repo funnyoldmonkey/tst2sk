@@ -15,6 +15,9 @@ def ensure_kb_dir():
 def append_fix(entry_text: str) -> dict:
     """Append a verified fix entry to kb/fixes.log."""
     cleaned = entry_text.strip() if entry_text else ""
+    # Strip AI thinking/reasoning blocks that some models emit (e.g. Gemma <thought> tags)
+    cleaned = re.sub(r'<thought>.*?</thought>', '', cleaned, flags=re.DOTALL).strip()
+    cleaned = re.sub(r'<thinking>.*?</thinking>', '', cleaned, flags=re.DOTALL).strip()
     if not cleaned or len(cleaned) < 10:
         return {"success": False, "error": "Entry is empty or too short. Provide a full fix entry with symptom, root cause, fix, and code."}
     ensure_kb_dir()
