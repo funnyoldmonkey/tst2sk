@@ -537,36 +537,35 @@ class Brain:
             if action in ("post_message", "answer_user"):
                 # ── Completion gate: block post_message if plan tasks remain ──
                 if self._plan:
+                    # Auto-complete "report/deliver" tasks — they ARE the post_message
+                    _report_keywords = {"report", "deliver", "compile", "summary", "findings"}
+                    for t in self._plan:
+                        if t["status"] != "done":
+                            task_lower = t["task"].lower()
+                            if any(kw in task_lower for kw in _report_keywords):
+                                t["status"] = "done"
+                                if not t.get("findings"):
+                                    t["findings"] = "Auto-completed: this task is the report delivery itself."
+
                     incomplete = [t for t in self._plan if t["status"] != "done"]
                     if incomplete:
                         incomplete_names = [t["task"] for t in incomplete[:5]]
                         gate_msg = (
                             f"⚠️ BLOCKED: You have {len(incomplete)} incomplete plan task(s): "
                             f"{incomplete_names}. "
-                            "Complete or explicitly skip each task before delivering your report. "
-                            "Use `update_plan` with `complete` + `findings` for each."
+                            "Mark each as complete (with findings) or skipped before using post_message. "
+                            "Use `update_plan` with `complete` + `findings` for each task."
                         )
                         await self._log("status", gate_msg)
+                        # Inject a simple text nudge — do NOT re-capture observation or
+                        # inject screenshots here. The loop top handles observation properly.
                         self.messages.append({
                             "role": "user",
-                            "content": f"System: {gate_msg}\n\nGo back and finish your remaining tasks. "
-                                       "If a task is not applicable, mark it complete with findings explaining why."
+                            "content": f"System: {gate_msg}\n\nGo back and mark each remaining task "
+                                       "complete with findings (or skip with explanation). "
+                                       "You cannot deliver your report until all tasks are resolved."
                         })
-                        try:
-                            obs = await capture_observation(self.browser)
-                        except Exception:
-                            obs = {"dom": "", "console": "", "network": "", "screenshot_base64": "", "url": "unknown", "visibility_issues": [], "shopify": None, "interactive_inventory": None}
-                        self._write_scratch_files(obs)
-                        self._persist_network_bodies()
-                        slim_obs = self._build_slim_observation(obs)
-                        obs_msg = self._build_observation_message(slim_obs, gate_msg, obs.get("url", "unknown"))
-                        self.messages.append({"role": "user", "content": obs_msg})
-                        if self.multimodal and obs.get("screenshot_base64"):
-                            self.messages.append({
-                                "role": "user",
-                                "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{obs['screenshot_base64']}"}}],
-                            })
-                        continue  # Back to top of loop — AI must finish tasks
+                        continue  # Back to top of loop — fresh observation captured there
 
                 self._recent_actions.clear()
                 message = payload.get("message", payload.get("text", ""))
@@ -629,6 +628,10 @@ class Brain:
             if action in LOCAL_ACTIONS:
                 result = self._handle_local_action(action, payload)
                 await self._log("result", result)
+
+                # Show plan in CLI when updated so user can track progress
+                if action == "update_plan" and result.get("success"):
+                    await self._display_plan()
 
                 # JIT: evaluate for contextual hints
                 jit_hints = self.jit.evaluate(
@@ -782,6 +785,25 @@ class Brain:
                 entry["findings"] = item["findings"]
             result.append(entry)
         return result
+
+    async def _display_plan(self):
+        """Display the current plan in the CLI as a visible panel."""
+        if not self._plan:
+            return
+        done = sum(1 for t in self._plan if t["status"] == "done")
+        total = len(self._plan)
+        lines = []
+        for i, item in enumerate(self._plan):
+            icon = {"pending": "⬜", "in_progress": "🔄", "done": "✅"}.get(item["status"], "⬜")
+            line = f"{icon} {i}. {item['task']}"
+            if item.get("findings"):
+                # Truncate findings for display
+                findings_short = item["findings"][:120] + ("..." if len(item["findings"]) > 120 else "")
+                line += f"\n     ↳ {findings_short}"
+            lines.append(line)
+        plan_text = "\n".join(lines)
+        header = f"📋 Plan ({done}/{total} complete)"
+        console.print(Panel(plan_text, title=header, style="blue", expand=False, width=min(console.width, 120)))
 
     def _get_plan_summary(self) -> dict | None:
         """Get a compact plan summary for injection into observations."""

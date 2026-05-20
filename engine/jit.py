@@ -362,9 +362,10 @@ def _css_before_js(ctx: _RuleContext) -> bool:
     tag="fix_without_verify",
     hint=(
         "JIT HINT: You applied a fix but haven't verified it yet. MANDATORY after every fix: "
-        "1) Run `run_test` with getComputedStyle assertions, "
-        "2) Check the screenshot/DOM for visual confirmation. "
-        "Both must pass before declaring the fix working."
+        "1) INTERACT — `click` the fixed element, `type` in inputs, `scroll` to check layout. Prove a real user can use it. "
+        "2) OBSERVE — Look at what changed after interaction. "
+        "3) ASSERT — Run `run_test` with getComputedStyle/getBoundingClientRect to confirm specific values. "
+        "All three steps are required. A passing run_test WITHOUT clicking is NOT verification."
     ),
     cooldown=4,
     priority=9,
@@ -692,9 +693,9 @@ def _try_dom_reconstruction(ctx: _RuleContext) -> bool:
 @_rule(
     tag="changes_detected_verify",
     hint=(
-        "JIT HINT: Changes were detected after your action! DOM/console/network shifted. "
-        "Run `run_test` NOW to verify if the change is what you intended. "
-        "Check computed styles on the target element to confirm the fix took effect."
+        "JIT HINT: Changes were detected after your fix! DOM/console/network shifted. "
+        "Now INTERACT with the fixed element — `click` it, `type` in it, `scroll` to it — "
+        "then `run_test` to assert the values. Don't skip the interaction step."
     ),
     cooldown=4,
     priority=7,
@@ -918,3 +919,42 @@ def _interact_dont_just_test(ctx: _RuleContext) -> bool:
     test_or_search = [a for a in recent if a in ("run_test", "search_dom", "search_console", "search_network", "inspect_element", "diagnose")]
 
     return not has_interaction and len(test_or_search) >= 3
+
+
+# ── Rule: Must INTERACT with fixed element before verifying or reporting ──
+@_rule(
+    tag="verify_without_interact",
+    hint=(
+        "JIT HINT: You applied a fix and jumped straight to run_test/post_message WITHOUT "
+        "interacting with the fixed element first. The fix-verify loop REQUIRES: "
+        "interact → observe → assert. You MUST `click`, `scroll`, `type`, or `hover` on the "
+        "fixed element BEFORE running run_test. A run_test alone does NOT prove the element works "
+        "from a user's perspective. Go back and CLICK the fixed element now."
+    ),
+    cooldown=4,
+    priority=10,  # Highest priority — this is a critical verification gap
+)
+def _verify_without_interact(ctx: _RuleContext) -> bool:
+    """Fires when AI does run_test or post_message after inject without clicking first."""
+    if ctx.action not in ("run_test", "post_message", "answer_user"):
+        return False
+
+    browser_actions = {"click", "scroll", "type", "hover", "click_at_position"}
+    fix_actions = {"inject_css", "inject_js"}
+
+    # Walk backwards from current action to find the last fix
+    actions = ctx.actions_used
+    last_fix_idx = -1
+    for i in range(len(actions) - 1, -1, -1):
+        if actions[i] in fix_actions:
+            last_fix_idx = i
+            break
+
+    if last_fix_idx < 0:
+        return False  # No fix applied yet
+
+    # Check if there's any browser interaction between the last fix and now
+    actions_since_fix = actions[last_fix_idx + 1:]
+    has_interaction = any(a in browser_actions for a in actions_since_fix)
+
+    return not has_interaction
