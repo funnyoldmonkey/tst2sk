@@ -1,6 +1,12 @@
 """Page observation — captures DOM, screenshot, console, network, visibility analysis."""
+import io
 import base64
+from PIL import Image
 from browser.controller import BrowserController
+
+# Screenshot settings — full-page JPEG, capped at 2000px tall
+_SCREENSHOT_MAX_HEIGHT = 2000
+_SCREENSHOT_JPEG_QUALITY = 80
 
 async def capture_observation(browser: BrowserController) -> dict:
     """Capture the full page state. Returns a dict with dom, console, network, screenshot_base64, url, visibility_issues.
@@ -331,10 +337,19 @@ async def capture_observation(browser: BrowserController) -> dict:
     except Exception:
         interactive_inventory = None
 
-    # 2. Screenshot as base64
+    # 2. Screenshot as base64 — full-page, resized + JPEG compressed
     try:
-        screenshot_bytes = await page.screenshot(full_page=False, type="png")
-        screenshot_base64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+        raw_bytes = await page.screenshot(full_page=True, type="png")
+        img = Image.open(io.BytesIO(raw_bytes))
+        if img.height > _SCREENSHOT_MAX_HEIGHT:
+            ratio = _SCREENSHOT_MAX_HEIGHT / img.height
+            img = img.resize((int(img.width * ratio), _SCREENSHOT_MAX_HEIGHT), Image.LANCZOS)
+        # Convert to RGB (JPEG doesn't support alpha) and compress
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        jpeg_buf = io.BytesIO()
+        img.save(jpeg_buf, format="JPEG", quality=_SCREENSHOT_JPEG_QUALITY)
+        screenshot_base64 = base64.b64encode(jpeg_buf.getvalue()).decode("utf-8")
     except Exception as e:
         screenshot_base64 = ""
 

@@ -26,7 +26,7 @@ Every observation includes the page screenshot. **YOU MUST actually look at the 
 1. **Identify** what's visually wrong — missing content, broken layout, invisible elements, error banners.
 2. **Cross-reference** what you see against DOM/console data. If DOM says elements exist but screenshot shows blank, elements are hidden.
 3. **Let the screenshot drive your next action.** If you see prices missing, search for price elements. If you see the page is blank, check positioning.
-4. **Screenshots are NOT complete.** They only show the current viewport. Elements outside the viewport, dynamically loaded content, and full-page element counts are invisible in screenshots. Before concluding ANY investigation or delivering findings, ALWAYS verify with `search_dom`, `search_console`, or `search_network`. Never treat the screenshot as the sole source of truth — it is one input, not the final answer.
+4. **Screenshots show the FULL PAGE** (resized to fit). You can see the entire page layout at a glance — use this to understand overall structure, spacing, and where sections are positioned. However, fine details (small text, button states) may be hard to read due to compression. For precise verification, use `search_dom`, `run_test`, or `inspect_element`. The screenshot is your map — DOM tools are your magnifying glass.
 **MANDATORY: Your thought MUST start with "Screenshot shows: [what you see]" every turn.** If you skip this, you are working blind.
 
 ## CONSOLE ERRORS — Verify, Don't Trust Blindly
