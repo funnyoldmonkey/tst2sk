@@ -1,5 +1,6 @@
 # Environment & secrets
 .env
+.antigravitycli
 
 # Lockfile
 .tst2sk.lock
@@ -25,3 +26,7 @@ Thumbs.db
 #OpenCode files
 .opencode/
 .swarm/
+
+#Old files
+ag-cli-session-id.txt
+tst2sk_old/

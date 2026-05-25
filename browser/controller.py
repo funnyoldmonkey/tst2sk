@@ -23,6 +23,7 @@ class BrowserController:
         self.console_logs: list[str] = []
         self.network_log: list[str] = []
         self.network_bodies: dict[str, str] = {}  # url -> response body (for interesting URLs)
+        self.network_details: dict[str, dict] = {}  # url -> detailed request/response info
 
     async def launch(self):
         """Launch browser, create page, attach CDP, start listeners."""
@@ -73,6 +74,19 @@ class BrowserController:
         """Capture network responses (capped at MAX_LOG_LINES)."""
         url = response.url
         status = response.status
+
+        # Build request/response details dict
+        request = response.request
+        details = {
+            "url": url,
+            "method": request.method,
+            "request_headers": request.headers,
+            "request_body": request.post_data,
+            "status": status,
+            "response_headers": response.headers,
+            "response_body": None
+        }
+
         if status >= 400:
             self.network_log.append(f"🚨 FAILED: {url} ({status})")
         else:
@@ -95,6 +109,30 @@ class BrowserController:
                     pass
             else:
                 self.network_log.append(f"✅ SUCCESS: {url.split('?')[0]} ({status})")
+
+        # Fetch body for interesting requests or failures status >= 400
+        is_interesting_details = (
+            status >= 400 or "/api/" in url or ".json" in url or "cart" in url
+        )
+        if is_interesting_details:
+            try:
+                body = None
+                if url in self.network_bodies:
+                    body = self.network_bodies[url]
+                else:
+                    body = await response.text()
+                    if len(body) > 1_000_000:
+                        body = body[:1_000_000] + "\n... [TRUNCATED — body exceeded 1MB]"
+                details["response_body"] = body
+            except Exception:
+                pass
+
+        # Save details
+        if len(self.network_details) >= MAX_NETWORK_BODIES:
+            oldest_key = next(iter(self.network_details))
+            del self.network_details[oldest_key]
+        self.network_details[url] = details
+
         # Cap network log (covers both success and failure paths)
         if len(self.network_log) > MAX_LOG_LINES:
             self.network_log = self.network_log[-MAX_LOG_LINES:]
@@ -147,6 +185,7 @@ class BrowserController:
         self.console_logs.clear()
         self.network_log.clear()
         self.network_bodies.clear()
+        self.network_details.clear()
         try:
             await self.page.goto(url, wait_until="networkidle", timeout=30000)
         except Exception:

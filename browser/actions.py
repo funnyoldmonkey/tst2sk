@@ -76,6 +76,43 @@ async def execute_action(browser: BrowserController, action: str, payload: dict)
 
         elif action == "inject_js":
             code = payload.get("code", "")
+            # Intercept and validate to prevent body/viewport width modifications
+            import re
+            normalized_js = re.sub(r'\s+', ' ', code).lower()
+            if (
+                "body.style.width" in normalized_js
+                or "body.style.minwidth" in normalized_js
+                or "body.style.maxwidth" in normalized_js
+                or "html.style.width" in normalized_js
+                or "html.style.minwidth" in normalized_js
+                or "html.style.maxwidth" in normalized_js
+                or "body.style =" in normalized_js
+                or "html.style =" in normalized_js
+                or re.search(r'\b(body|html)\.style\b', normalized_js) and re.search(r'\b(width|minwidth|maxwidth)\b', normalized_js)
+                or re.search(r'queryselector\(\s*[\'"](body|html)[\'"]\s*\)\.style', normalized_js)
+                or re.search(r'style\.setproperty\(\s*[\'"](min-|max-)?width[\'"]', normalized_js)
+                or re.search(r'setattribute\(\s*[\'"]style[\'"]\s*,\s*[\'"][^\'"]*\b(width|min-width|max-width)\b', normalized_js)
+            ):
+                return (
+                    "[error] Action rejected: Modifying the width of the <body> or <html> elements "
+                    "via JavaScript style properties is strictly prohibited. Modifying body dimensions "
+                    "bypassing Playwright viewport commands causes layout collapse. Please use standard viewport "
+                    "settings or adjust elements themselves instead of resizing the root body/html layout."
+                )
+
+            # Auto-wrap in IIFE to prevent const/let redeclaration errors.
+            # CDP's Runtime.evaluate persists const/let declarations across calls,
+            # so repeated inject_js with the same variable names causes SyntaxError.
+            # Skip wrapping if the code already starts with an IIFE pattern.
+            stripped = code.strip()
+            already_iife = (
+                stripped.startswith("(function") or
+                stripped.startswith("(()") or
+                stripped.startswith("!function") or
+                stripped.startswith("void function")
+            )
+            if not already_iife and code.strip():
+                code = f"(function(){{\n{code}\n}})()"
             # Use CDP Runtime.evaluate to bypass CSP
             result = await cdp.send("Runtime.evaluate", {
                 "expression": code,
@@ -96,6 +133,16 @@ async def execute_action(browser: BrowserController, action: str, payload: dict)
 
         elif action == "inject_css":
             css = payload.get("css", "")
+            import re
+            normalized_css = re.sub(r'\s+', ' ', css).lower()
+            if re.search(r'\b(body|html)\b\s*\{[^}]*\b(width|min-width|max-width)\b', normalized_css):
+                return (
+                    "[error] Action rejected: Modifying the width (width, min-width, max-width) "
+                    "of the <body> or <html> element via CSS is strictly prohibited. Changing body dimensions "
+                    "leads to broken layouts and layout collapse. Use proper browser tools if you need to "
+                    "adjust viewport size."
+                )
+
             await page.add_style_tag(content=css)
             return "inject_css applied"
 
@@ -163,6 +210,16 @@ async def execute_action(browser: BrowserController, action: str, payload: dict)
 
         elif action == "observe":
             return "observe requested — fresh observation coming"
+
+        elif action == "reload":
+            await browser.navigate(browser.page.url)
+            return "Page reloaded"
+
+        elif action == "set_viewport_size":
+            width = int(payload.get("width", 1440))
+            height = int(payload.get("height", 900))
+            await page.set_viewport_size({"width": width, "height": height})
+            return f"Viewport size set to {width}x{height}"
 
         elif action == "clear_site_data":
             await browser.page.context.clear_cookies()
@@ -357,6 +414,225 @@ async def execute_action(browser: BrowserController, action: str, payload: dict)
             if len(value) > 20:
                 msg += f"\n... [showing 20 of {len(value)} — full results in scratch/cdp_query_results.json]"
             return msg
+
+        elif action == "cdp_get_matched_styles":
+            selector = payload.get("selector", "")
+            if not selector:
+                return "[error] cdp_get_matched_styles requires a 'selector' payload"
+            doc_result = await cdp.send("DOM.getDocument", {"depth": 0})
+            root_id = doc_result["root"]["nodeId"]
+            search_result = await cdp.send("DOM.querySelector", {
+                "nodeId": root_id,
+                "selector": selector,
+            })
+            node_id = search_result.get("nodeId", 0)
+            if not node_id:
+                return f"[error] cdp_get_matched_styles: selector not found — \"{selector}\""
+            
+            matched_styles = await cdp.send("CSS.getMatchedStylesForNode", {
+                "nodeId": node_id
+            })
+            _save_cdp_result("cdp_matched_styles.json", {"selector": selector, "matched_styles": matched_styles})
+            
+            inline_props = []
+            if "inlineStyle" in matched_styles and matched_styles["inlineStyle"]:
+                inline_props = [
+                    f"{p['name']}: {p['value']}{' !important' if p.get('important') else ''}"
+                    for p in matched_styles["inlineStyle"].get("cssProperties", [])
+                    if not p.get("disabled")
+                ]
+            
+            rules_summary = []
+            if "matchedCSSRules" in matched_styles:
+                for match in matched_styles["matchedCSSRules"]:
+                    rule = match.get("rule", {})
+                    selectors = [s["text"] for s in rule.get("selectorList", {}).get("selectors", [])]
+                    props = [
+                        f"  {p['name']}: {p['value']}{' !important' if p.get('important') else ''}"
+                        for p in rule.get("style", {}).get("cssProperties", [])
+                        if not p.get("disabled")
+                    ]
+                    origin = rule.get("origin", "")
+                    media = []
+                    if "media" in rule:
+                        for m in rule["media"]:
+                            media.append(m.get("text", ""))
+                    
+                    rule_header = f"Rule: {', '.join(selectors)}"
+                    if media:
+                        rule_header = f"@media {', '.join(media)} {{ {rule_header} }}"
+                    if origin:
+                        rule_header += f" (origin: {origin})"
+                    
+                    rules_summary.append(rule_header + "\n" + "\n".join(props))
+
+            summary_str = ""
+            if inline_props:
+                summary_str += "Inline Style:\n  " + "; ".join(inline_props) + "\n\n"
+            summary_str += "Matched CSS Rules:\n" + "\n\n".join(rules_summary)
+            
+            preview = summary_str[:3000]
+            if len(summary_str) > 3000:
+                preview += "\n... [TRUNCATED — full rules saved to scratch/cdp_matched_styles.json]"
+            
+            browser.console_logs.append(f">>> CDP matched styles [{selector}] → saved to scratch/cdp_matched_styles.json")
+            return f"cdp_get_matched_styles({selector}):\n{preview}"
+
+        elif action == "cdp_get_event_listeners":
+            selector = payload.get("selector", "")
+            if not selector:
+                return "[error] cdp_get_event_listeners requires a 'selector' payload"
+            doc_result = await cdp.send("DOM.getDocument", {"depth": 0})
+            root_id = doc_result["root"]["nodeId"]
+            search_result = await cdp.send("DOM.querySelector", {
+                "nodeId": root_id,
+                "selector": selector,
+            })
+            node_id = search_result.get("nodeId", 0)
+            if not node_id:
+                return f"[error] cdp_get_event_listeners: selector not found — \"{selector}\""
+            
+            resolved = await cdp.send("DOM.resolveNode", {"nodeId": node_id})
+            object_id = resolved.get("object", {}).get("objectId")
+            if not object_id:
+                return f"[error] cdp_get_event_listeners: failed to resolve node to object — \"{selector}\""
+            
+            listeners_data = await cdp.send("DOMDebugger.getEventListeners", {
+                "objectId": object_id
+            })
+            listeners = listeners_data.get("listeners", [])
+            _save_cdp_result("cdp_event_listeners.json", {"selector": selector, "listeners": listeners})
+            
+            formatted_listeners = []
+            for i, l in enumerate(listeners):
+                loc = l.get("location", {})
+                line = loc.get("lineNumber", 0)
+                col = loc.get("columnNumber", 0)
+                script_id = loc.get("scriptId", "")
+                
+                handler = l.get("handler", {})
+                description = handler.get("description", "anonymous function")
+                
+                formatted_listeners.append(
+                    f"{i+1}. Event: '{l.get('type')}'\n"
+                    f"   Handler: {description}\n"
+                    f"   Location: line {line}, col {col} (scriptId: {script_id})\n"
+                    f"   useCapture: {l.get('useCapture')}, passive: {l.get('passive')}, once: {l.get('once')}"
+                )
+            
+            if not formatted_listeners:
+                return f"cdp_get_event_listeners({selector}): No event listeners found registered directly on this element."
+            
+            summary_str = "\n\n".join(formatted_listeners)
+            browser.console_logs.append(f">>> CDP event listeners [{selector}]: {len(listeners)} found → saved to scratch/cdp_event_listeners.json")
+            return f"cdp_get_event_listeners({selector}, {len(listeners)} total):\n{summary_str}"
+
+        elif action == "search_all_frames":
+            selector = payload.get("selector", "")
+            if not selector:
+                return "[error] search_all_frames requires a 'selector' payload"
+            
+            matches = []
+            js_code = """([sel]) => {
+                function findInShadow(root, selector) {
+                    let found = [];
+                    const all = root.querySelectorAll('*');
+                    for (const el of all) {
+                        try {
+                            if (el.matches(selector)) {
+                                found.push(el);
+                            }
+                        } catch(e) {}
+                        if (el.shadowRoot) {
+                            found = found.concat(findInShadow(el.shadowRoot, selector));
+                        }
+                    }
+                    return found;
+                }
+                
+                function getElementInfo(el) {
+                    const r = el.getBoundingClientRect();
+                    let shadowHostInfo = null;
+                    let root = el.getRootNode();
+                    if (root instanceof ShadowRoot) {
+                        const host = root.host;
+                        shadowHostInfo = {
+                            tag: host.tagName.toLowerCase(),
+                            id: host.id || '',
+                            className: host.className || ''
+                        };
+                    }
+                    return {
+                        tag: el.tagName.toLowerCase(),
+                        id: el.id || '',
+                        className: (el.className && typeof el.className === 'string') ? el.className.substring(0, 60) : '',
+                        text: (el.innerText || el.value || '').trim().substring(0, 100),
+                        rect: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+                        attributes: Array.from(el.attributes).reduce((acc, attr) => {
+                            acc[attr.name] = attr.value; return acc;
+                        }, {}),
+                        shadowHost: shadowHostInfo
+                    };
+                }
+                
+                try {
+                    const matches = findInShadow(document, sel);
+                    return matches.map(getElementInfo);
+                } catch(e) {
+                    return [];
+                }
+            }"""
+            
+            for frame in page.frames:
+                try:
+                    elements_data = await frame.evaluate(js_code, [selector])
+                    for el in elements_data:
+                        matches.append({
+                            "frame_url": frame.url,
+                            "frame_name": frame.name or "",
+                            "element": el
+                        })
+                except Exception:
+                    continue
+            
+            _save_cdp_result("search_all_frames_results.json", {"selector": selector, "matches": matches})
+            
+            if not matches:
+                return f"search_all_frames({selector}): No matches found in any frame or shadowRoot."
+            
+            result_str = _json_mod.dumps(matches, indent=1, default=str)
+            preview = result_str[:3500]
+            if len(result_str) > 3500:
+                preview += "\n... [TRUNCATED — full results saved to scratch/search_all_frames_results.json]"
+            
+            browser.console_logs.append(f">>> search_all_frames({selector}): {len(matches)} matches → saved to scratch/search_all_frames_results.json")
+            return f"search_all_frames({selector}, {len(matches)} matches total):\n{preview}"
+
+        elif action == "cdp_get_network_details":
+            url_pattern = payload.get("urlPattern", "")
+            if not url_pattern:
+                return "[error] cdp_get_network_details requires a 'urlPattern' payload"
+            
+            matches = []
+            for url, details in browser.network_details.items():
+                if url_pattern in url:
+                    matches.append(details)
+            
+            if not matches:
+                log_matches = [line for line in browser.network_log if url_pattern in line]
+                msg = f"[error] No network request details captured matching pattern: \"{url_pattern}\""
+                if log_matches:
+                    msg += f"\nNote: The network log contains the following matching lines:\n" + "\n".join(log_matches)
+                return msg
+            
+            _save_cdp_result("cdp_network_details.json", matches)
+            result_str = _json_mod.dumps(matches, indent=2, default=str)
+            preview = result_str[:4000]
+            if len(result_str) > 4000:
+                preview += "\n... [TRUNCATED — full details saved to scratch/cdp_network_details.json]"
+            
+            browser.console_logs.append(f">>> CDP network details for pattern [{url_pattern}] → saved to scratch/cdp_network_details.json")
+            return f"cdp_get_network_details({url_pattern}):\n{preview}"
 
         else:
             return f"[error] Unknown action: {action}"

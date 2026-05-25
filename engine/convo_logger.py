@@ -221,7 +221,7 @@ class ConvoLogger:
         self.diagnosis_hints: list[str] = []
         self.resolved = False
         self._saved = False
-        self._save_lock = threading.Lock()  # Thread-safe save guard
+        self._save_lock = threading.RLock()  # Reentrant lock — safe if signal fires during save
 
     def log(self, msg_type: str, content: any):
         """Add an entry to the conversation log."""

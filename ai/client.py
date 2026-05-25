@@ -93,6 +93,8 @@ class AIClient:
                     break
             if last_user_idx is not None:
                 text_content = api_messages[last_user_idx]["content"]
+                # Deep-copy the message to avoid mutating the original in self.messages
+                api_messages[last_user_idx] = dict(api_messages[last_user_idx])
                 api_messages[last_user_idx]["content"] = [
                     {"type": "text", "text": text_content},
                     {
@@ -107,9 +109,17 @@ class AIClient:
 
     @staticmethod
     def _is_retryable(e: Exception) -> bool:
-        """Check if an exception is retryable (rate limit, server error, timeout)."""
+        """Check if an exception is retryable (rate limit, server error, timeout).
+
+        IMPORTANT: 400 errors (bad request) are NOT retryable — they indicate
+        malformed input (e.g., context too large) that won't self-resolve.
+        """
         error_str = str(e).lower()
         status = getattr(e, "status_code", None) or getattr(e, "code", None)
+
+        # 400 = bad request — never retry (context overflow, malformed input)
+        if status == 400 or ("400" in str(getattr(e, "status_code", ""))):
+            return False
 
         return (
             status in (429, 500, 502, 503, 529)
@@ -210,7 +220,7 @@ class AIClient:
                     payload["text"] = text_match.group(1).strip()
 
         elif action in ("search_dom", "search_console", "search_network",
-                        "search_playbook", "search_fixes", "search_conversations"):
+                        "search_playbook", "search_fixes", "search_context", "search_conversations"):
             q_match = re.search(r'"query"\s*:\s*"(.*?)(?:"|$)', raw_text)
             if q_match:
                 payload = {"query": q_match.group(1).strip()}
@@ -247,6 +257,15 @@ class AIClient:
             if fn_match:
                 payload = {"filename": fn_match.group(1).strip()}
 
+        elif action == "investigate":
+            q_match = re.search(r'"query"\s*:\s*"(.*?)(?:"|$)', raw_text)
+            if q_match:
+                payload = {"query": q_match.group(1).strip()}
+
+        elif action in ("verify_fix", "build_report"):
+            # These actions take minimal or no payload — extract what's there
+            pass  # payload stays empty, brain.py fills defaults
+
         elif action == "log_fix":
             entry_match = re.search(r'"entry"\s*:\s*"(.*?)(?:"\s*[,}]|$)', raw_text, re.DOTALL)
             if entry_match:
@@ -257,12 +276,42 @@ class AIClient:
             if depth_match:
                 payload = {"depth": int(depth_match.group(1))}
 
-        elif action in ("cdp_get_computed_style", "cdp_query_selector_all"):
+        elif action in ("cdp_get_computed_style", "cdp_query_selector_all", "cdp_get_matched_styles", "cdp_get_event_listeners", "search_all_frames"):
             sel_match = re.search(r'"selector"\s*:\s*"(.*?)(?:"|$)', raw_text)
             if sel_match:
                 payload = {"selector": sel_match.group(1).strip()}
 
+        elif action == "cdp_get_network_details":
+            pat_match = re.search(r'"urlPattern"\s*:\s*"(.*?)(?:"|$)', raw_text)
+            if pat_match:
+                payload = {"urlPattern": pat_match.group(1).strip()}
+
         # observe, clear_site_data, diagnose, cdp_get_cookies, cdp_get_page_metrics — no payload needed
+
+        # --- Post-message signal detection ---
+        # If the action is still "observe" (default fallback) but the raw text looks
+        # like a report/message to the user, extract it as post_message instead.
+        # This prevents false loop detection when the AI outputs markdown reports.
+        if action == "observe" and len(raw_text) > 100:
+            text_lower = raw_text.lower()
+            post_message_signals = sum([
+                "root cause" in text_lower,
+                "fix applied" in text_lower or "fix:" in text_lower,
+                "summary" in text_lower,
+                "verified" in text_lower,
+                "finding" in text_lower,
+                "recommend" in text_lower,
+                "steps taken" in text_lower,
+                "investigation" in text_lower,
+            ])
+            if post_message_signals >= 2:
+                action = "post_message"
+                # Use the raw text as the message (strip markdown fences if present)
+                msg_text = raw_text
+                if msg_text.startswith("```"):
+                    msg_text = re.sub(r'^```\w*\n?', '', msg_text)
+                    msg_text = re.sub(r'\n?```$', '', msg_text)
+                payload = {"message": msg_text.strip()}
 
         if not thought:
             thought = f"[JSON_PARSE_ERROR] Raw response: {raw_text}"
@@ -292,17 +341,30 @@ class AIClient:
                 # Scheduled rotation before each request
                 self._maybe_rotate_scheduled()
 
+                import time as _time
+                _t0 = _time.monotonic()
                 response = await self.client.chat.completions.create(
                     model=self.model,
                     messages=api_messages,
                     temperature=0.2,
                     max_tokens=4096,
                 )
+                _elapsed = round(_time.monotonic() - _t0, 1)
                 raw_text = response.choices[0].message.content
                 if not raw_text:
                     return {"thought": "[Empty response from model]", "action": "observe", "payload": {}}, ""
                 raw_text = raw_text.strip()
                 action_data = self._parse_json_response(raw_text)
+
+                # Attach timing + usage metadata for CLI debug logging
+                usage = getattr(response, "usage", None)
+                action_data["_meta"] = {
+                    "elapsed_s": _elapsed,
+                    "model": self.model,
+                    "prompt_tokens": getattr(usage, "prompt_tokens", None) if usage else None,
+                    "completion_tokens": getattr(usage, "completion_tokens", None) if usage else None,
+                    "total_tokens": getattr(usage, "total_tokens", None) if usage else None,
+                }
                 return action_data, raw_text
 
             except Exception as e:

@@ -254,8 +254,42 @@ def cross_reference_diagnostics() -> dict:
         scenario = "shopify_store"
         confidence = min(95, 60 + len(shopify_signals) * 10)
 
-    # Checkout/Cart detection
-    if any(k in dom_content.lower() for k in ["cart", "checkout", "payment", "shipping"]):
+    # Checkout/Cart detection — require STRONG signals, not just keyword presence.
+    # "cart" appears on nearly every product page (add-to-cart button, cart icon, etc.)
+    # so we need URL-level or structural evidence to classify as checkout.
+    url_from_dom = ""
+    try:
+        # Try to get URL from network log (first line often has the page URL)
+        for line in network_content.split("\n")[:5]:
+            if "document" in line.lower() and ("http://" in line or "https://" in line):
+                url_from_dom = line
+                break
+    except Exception:
+        pass
+
+    # Strong signals: things that ONLY exist on actual checkout/cart pages
+    # NOT just href="/checkout" in nav links (that appears on every Shopify page)
+    checkout_strong_signals = [
+        "checkout-step" in dom_content.lower(),
+        "payment-method" in dom_content.lower(),
+        "shipping-address" in dom_content.lower(),
+        'data-step="' in dom_content.lower(),
+        "order-summary" in dom_content.lower(),
+        "checkout__main" in dom_content.lower(),
+    ]
+    # Medium signals: present on cart/checkout but also sometimes elsewhere
+    checkout_medium_signals = [
+        # URL-based (strongest indicator — the page itself is /checkout or /cart)
+        "/checkout" in network_content.split("\n")[0] if network_content else False,
+        # cart-template is specific to the cart page, not just any page with a cart icon
+        "cart-template" in dom_content.lower() or "template--cart" in dom_content.lower(),
+    ]
+    strong_count = sum(1 for s in checkout_strong_signals if s)
+    medium_count = sum(1 for s in checkout_medium_signals if s)
+    checkout_signal_count = strong_count + medium_count
+
+    # Require at least 1 strong signal, or 2+ medium signals
+    if strong_count >= 1 or medium_count >= 2:
         if scenario == "shopify_store":
             scenario = "shopify_checkout"
             confidence = min(95, confidence + 5)
@@ -273,6 +307,18 @@ def cross_reference_diagnostics() -> dict:
     shopify_analysis = None
     if "shopify" in scenario:
         shopify_analysis = _analyze_shopify(dom_content, network_content, scripts)
+        # Use _analyze_shopify's page_type to refine scenario if we wrongly classified
+        if shopify_analysis:
+            page_type = shopify_analysis.get("page_type", "unknown")
+            if page_type == "product" and scenario == "shopify_checkout":
+                scenario = "shopify_product"
+                confidence = min(95, confidence)
+            elif page_type == "collection" and scenario == "shopify_checkout":
+                scenario = "shopify_collection"
+                confidence = min(90, confidence)
+            elif page_type == "product":
+                scenario = "shopify_product"
+                confidence = min(95, confidence)
 
     # --- Potential Issues ---
     issues = []
@@ -304,4 +350,19 @@ def cross_reference_diagnostics() -> dict:
     }
     if shopify_analysis:
         result["shopify_analysis"] = shopify_analysis
+
+    # Note: Product context files (context/*.md) are NOT injected into diagnose results.
+    # They were too large (~4K tokens) and got truncated to ~750 tokens, wasting budget
+    # and displacing other diagnostic data. The AI should use search_context explicitly.
+    # We still flag that context files exist so JIT can nudge the AI to search them.
+    context_dir = "context"
+    if os.path.isdir(context_dir):
+        context_files = [f for f in sorted(os.listdir(context_dir)) if f.endswith(".md")]
+        if context_files:
+            result["context_files_available"] = context_files
+            result["⚠️_context_hint"] = (
+                f"Context files found: {', '.join(context_files)}. "
+                "Run `search_context` with product keywords to get targeted guidance."
+            )
+
     return result

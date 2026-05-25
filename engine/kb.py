@@ -69,6 +69,45 @@ def search_playbook(query: str) -> dict:
     
     return {"query": query, "matches": matches[:3]}
 
+CONTEXT_DIR = "context"
+
+def search_context(query: str) -> dict:
+    """Search context/*.md files for entries matching query keywords."""
+    if not os.path.isdir(CONTEXT_DIR):
+        return {"error": "No context/ directory found", "matches": []}
+
+    query_lower = query.lower()
+    keywords = [k.strip() for k in re.split(r'[|,\s]+', query_lower) if k.strip()]
+    if not keywords:
+        return {"error": "Empty query", "matches": []}
+
+    matches = []
+    for fname in sorted(os.listdir(CONTEXT_DIR)):
+        if not fname.endswith(".md"):
+            continue
+        fpath = os.path.join(CONTEXT_DIR, fname)
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception:
+            continue
+
+        # Split into sections by ## headers
+        sections = re.split(r'\n(?=##\s)', content)
+        for section in sections:
+            section_lower = section.lower()
+            if any(kw in section_lower for kw in keywords):
+                # Truncate long sections
+                preview = section.strip()[:500]
+                if len(section.strip()) > 500:
+                    preview += "..."
+                matches.append({"file": fname, "section": preview})
+
+    if not matches:
+        return {"matches": [], "message": f"No context matches for: {query}"}
+    return {"matches": matches[:10]}
+
+
 def find_relevant_fixes(scenario: str, url: str, diagnosis_hints: list = None) -> list:
     """Auto-search KB for entries matching scenario/URL/hints."""
     relevant = []

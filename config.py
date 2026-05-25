@@ -53,7 +53,8 @@ class AppConfig:
     multimodal: bool = True  # True = send screenshots (vision model), False = text-only
     headless: bool = False  # Show browser window by default
     max_turns: int = 0  # Unused — agent runs until naturally done (kept for future use)
-    max_history: int = 20  # Max conversation turns to keep in context
+    max_history: int = 14  # Max conversation turns to keep in context
+    observation_budget: int = 12000  # Max chars for observation context per turn
     round_robin_switch: int = 3  # Rotate API key after N requests (Google only)
 
     @classmethod

@@ -39,7 +39,12 @@ class JITEngine:
         self._playbook_searched: bool = False
         self._fixes_searched: bool = False
         self._conversations_searched: bool = False
-        self._cdp_used: bool = False
+        self._cdp_styles_used: bool = False    # cdp_get_computed_style
+        self._cdp_qsa_used: bool = False       # cdp_query_selector_all
+        self._cdp_any_used: bool = False       # any CDP action
+        self._context_searched: bool = False
+        self._verify_fix_done: bool = False
+        self._last_eval_debug: dict = {}  # Debug info from last evaluate() call
 
     def evaluate(
         self,
@@ -64,14 +69,29 @@ class JITEngine:
         # Track tool usage flags
         if action == "diagnose":
             self._diagnose_done = True
+            # NOTE: Do NOT auto-set _context_searched when diagnose returns product_context.
+            # The AI must explicitly call search_context to set this flag.
+        elif action == "investigate":
+            # Investigate subagent covers diagnose + search_context + optionally playbook/fixes
+            self._diagnose_done = True
+            self._context_searched = True
+            # Playbook/fixes flags set by brain.py based on investigation results
         elif action == "search_playbook":
             self._playbook_searched = True
         elif action == "search_fixes":
             self._fixes_searched = True
         elif action == "search_conversations":
             self._conversations_searched = True
+        elif action == "search_context":
+            self._context_searched = True
+        elif action == "verify_fix":
+            self._verify_fix_done = True
         elif action.startswith("cdp_"):
-            self._cdp_used = True
+            self._cdp_any_used = True
+            if action == "cdp_get_computed_style":
+                self._cdp_styles_used = True
+            elif action == "cdp_query_selector_all":
+                self._cdp_qsa_used = True
 
         # Build context for rule evaluation
         ctx = _RuleContext(
@@ -87,29 +107,67 @@ class JITEngine:
             playbook_searched=self._playbook_searched,
             fixes_searched=self._fixes_searched,
             conversations_searched=self._conversations_searched,
-            cdp_used=self._cdp_used,
+            cdp_styles_used=self._cdp_styles_used,
+            cdp_qsa_used=self._cdp_qsa_used,
+            cdp_any_used=self._cdp_any_used,
+            context_searched=self._context_searched,
+            verify_fix_done=self._verify_fix_done,
         )
 
         # Evaluate all rules (each rule is isolated — one bad rule can't kill the engine)
         fired = []
+        on_cooldown = []
+        errored = []
         for rule, check_fn in _ALL_RULES:
             # Cooldown check
             last = self._last_fired.get(rule.tag, -999)
             if (turn - last) < rule.cooldown:
+                remaining = rule.cooldown - (turn - last)
+                on_cooldown.append((rule.tag, remaining))
                 continue
             # Trigger check — isolated so one broken rule doesn't kill all JIT
             try:
                 if check_fn(ctx):
                     fired.append((rule.priority, rule.hint, rule.tag))
                     self._last_fired[rule.tag] = turn
-            except Exception:
-                pass  # Skip broken rule silently
+            except Exception as e:
+                errored.append((rule.tag, str(e)[:80]))
 
         # Sort by priority (highest first)
         fired.sort(key=lambda x: -x[0])
 
-        # Cap at 3 hints per turn to avoid overwhelming the AI
-        return [hint for _, hint, _ in fired[:3]]
+        # Store debug info for CLI logging
+        self._last_eval_debug = {
+            "fired": [(tag, pri) for pri, _, tag in fired],
+            "on_cooldown": on_cooldown,
+            "errored": errored,
+            "total_rules": len(_ALL_RULES),
+        }
+
+        # Cap at 1 hint per turn — the highest priority one only.
+        # Multiple hints overwhelm small models and dilute the signal.
+        return [hint for _, hint, _ in fired[:1]]
+
+    def get_state_summary(self) -> dict:
+        """Return current JIT engine state for debug logging."""
+        return {
+            "diagnose_done": self._diagnose_done,
+            "context_searched": self._context_searched,
+            "playbook_searched": self._playbook_searched,
+            "fixes_searched": self._fixes_searched,
+            "conversations_searched": self._conversations_searched,
+            "cdp_any_used": self._cdp_any_used,
+            "cdp_styles_used": self._cdp_styles_used,
+            "cdp_qsa_used": self._cdp_qsa_used,
+            "actions_count": len(self._actions_used),
+            "last_3_actions": self._actions_used[-3:] if self._actions_used else [],
+            "verify_fix_done": self._verify_fix_done,
+            "rules_on_cooldown": len([t for t, _ in self._last_eval_debug.get("on_cooldown", [])]),
+        }
+
+    def get_last_eval_debug(self) -> dict:
+        """Return debug info from the last evaluate() call."""
+        return self._last_eval_debug
 
 
 class _RuleContext:
@@ -118,7 +176,8 @@ class _RuleContext:
         "action", "payload", "result", "turn", "scenario", "slim_obs",
         "actions_used", "search_cache", "diagnose_done",
         "playbook_searched", "fixes_searched", "conversations_searched",
-        "cdp_used",
+        "cdp_styles_used", "cdp_qsa_used", "cdp_any_used",
+        "context_searched", "verify_fix_done",
     )
 
     def __init__(self, **kwargs):
@@ -235,7 +294,7 @@ def _suggest_cdp_styles(ctx: _RuleContext) -> bool:
     if ctx.action != "inspect_element":
         return False
     inspect_count = ctx.actions_used.count("inspect_element")
-    return inspect_count >= 2 and not ctx.cdp_used
+    return inspect_count >= 2 and not ctx.cdp_styles_used
 
 
 @_rule(
@@ -252,7 +311,7 @@ def _suggest_cdp_cookies(ctx: _RuleContext) -> bool:
     # Fire when investigating auth/session issues
     if ctx.scenario not in ("auth_flow",):
         return False
-    return not ctx.cdp_used and ctx.turn >= 3
+    return not ctx.cdp_any_used and ctx.turn >= 3
 
 
 @_rule(
@@ -270,7 +329,7 @@ def _suggest_cdp_metrics(ctx: _RuleContext) -> bool:
     obs = ctx.slim_obs
     dom = obs.get("dom", {})
     total = dom.get("total_elements", 0)
-    return total >= 900 and not ctx.cdp_used
+    return total >= 900 and not ctx.cdp_any_used
 
 
 @_rule(
@@ -289,7 +348,7 @@ def _suggest_cdp_queryselector(ctx: _RuleContext) -> bool:
     if ctx.action != "search_dom":
         return False
     search_dom_count = ctx.actions_used.count("search_dom")
-    return search_dom_count >= 3 and not ctx.cdp_used
+    return search_dom_count >= 3 and not ctx.cdp_qsa_used
 
 
 # ─── Missing Tool Usage ──────────────────────────────────────────
@@ -297,12 +356,14 @@ def _suggest_cdp_queryselector(ctx: _RuleContext) -> bool:
 @_rule(
     tag="missing_diagnose",
     hint=(
-        "JIT HINT: You haven't run `diagnose` yet. It provides scenario detection, "
-        "console error classification (real vs suspicious), Shopify analysis, and "
-        "hidden element counts. Run it FIRST — it gives you the full picture."
+        "⛔ STOP — You MUST run `investigate` before fixing anything. It's a specialized subagent "
+        "that reads ALL data sources (DOM, console, network, context docs, playbooks, past fixes) "
+        "and returns a structured briefing with scenario, critical info, and recommended approach. "
+        "This replaces diagnose + search_context + search_playbook + search_fixes in ONE call. "
+        "Run `investigate` NOW with keywords from the user's query."
     ),
-    cooldown=10,
-    priority=10,
+    cooldown=2,
+    priority=11,  # Higher than all other rules — investigate is non-negotiable
 )
 def _missing_diagnose(ctx: _RuleContext) -> bool:
     return ctx.turn >= 2 and not ctx.diagnose_done
@@ -338,6 +399,144 @@ def _missing_conversations(ctx: _RuleContext) -> bool:
     return ctx.turn >= 8 and ctx.playbook_searched and not ctx.conversations_searched
 
 
+# ─── Context Folder Awareness ────────────────────────────────────
+
+@_rule(
+    tag="fix_without_context",
+    hint=(
+        "⛔ STOP — You are injecting code WITHOUT checking product context first. "
+        "The context/ folder has critical info: iframe rendering (BIS modal is inside #BIS_frame iframe — "
+        "inject_css WON'T WORK, you need inject_js targeting frame.contentDocument), DOM selectors, "
+        "scoping rules, and known fix patterns. "
+        "Run `search_context` NOW with keywords like 'BIS', 'slide cart', 'modal', 'iframe', 'drawer' "
+        "BEFORE your next inject. Skipping this leads to wasted turns fixing the wrong thing."
+    ),
+    cooldown=4,
+    priority=10,
+)
+def _fix_without_context(ctx: _RuleContext) -> bool:
+    """Fire when AI injects CSS/JS without checking context — high priority blocker.
+
+    Does NOT require diagnose_done — if context files exist and the AI is injecting
+    code, it should have checked context regardless of whether diagnose was run.
+    """
+    if ctx.action not in ("inject_css", "inject_js"):
+        return False
+    if ctx.context_searched:
+        return False
+    import os
+    if not os.path.isdir("context") or not any(f.endswith(".md") for f in os.listdir("context")):
+        return False
+    return True
+
+
+@_rule(
+    tag="inspect_before_fix",
+    hint=(
+        "⚠️ You are injecting a fix WITHOUT inspecting the target element first. "
+        "BEFORE any inject_css or inject_js, you MUST verify the selector exists using "
+        "`inspect_element`, `cdp_query_selector_all`, or `run_test` with querySelector. "
+        "Guessing selectors wastes turns — inspect first, then fix what you KNOW exists."
+    ),
+    cooldown=2,
+    priority=10,
+)
+def _inspect_before_fix(ctx: _RuleContext) -> bool:
+    """Fires when AI injects CSS/JS without prior inspection of the target."""
+    if ctx.action not in ("inject_css", "inject_js"):
+        return False
+    inspection_actions = {
+        "inspect_element", "cdp_query_selector_all", "cdp_get_computed_style",
+        "cdp_get_matched_styles", "cdp_get_event_listeners", "search_all_frames",
+        "cdp_get_network_details", "run_test", "search_dom"
+    }
+    recent = ctx.actions_used[-6:-1] if len(ctx.actions_used) > 5 else ctx.actions_used[:-1]
+    has_inspection = any(a in inspection_actions for a in recent)
+    return not has_inspection
+
+
+@_rule(
+    tag="no_css_in_iframe",
+    hint=(
+        "⛔ WRONG APPROACH: You are using `inject_css` to style an element INSIDE an IFRAME. "
+        "CSS injected into the main page CANNOT reach inside an iframe. You MUST use `inject_js` "
+        "to inject a <style> tag into the iframe's contentDocument. Example:\n"
+        "(function() {\n"
+        "  const frame = document.getElementById('BIS_frame');\n"
+        "  if (frame && frame.contentDocument) {\n"
+        "    const style = frame.contentDocument.createElement('style');\n"
+        "    style.textContent = '/* your CSS here */';\n"
+        "    frame.contentDocument.head.appendChild(style);\n"
+        "  }\n"
+        "})();"
+    ),
+    cooldown=3,
+    priority=10,
+)
+def _no_css_in_iframe(ctx: _RuleContext) -> bool:
+    """Fires ONLY when inject_css targets selectors known to be inside an iframe.
+
+    Previous version was too broad — it fired whenever inject_js had been used before,
+    even when the CSS targeted main-document elements like .amp-buy-x-get-y-bundles or
+    #ProductSubmitButton. This caused false positives that confused the AI into
+    second-guessing correct CSS fixes.
+
+    Now it checks the actual CSS payload for selectors that reference iframe-interior
+    elements (e.g., #BIS_frame content, .bis-modal internals, .back-in-stock form elements).
+    Elements that merely have "bis" or "BIS" in their class name but live in the main
+    document (like .bis-button.BIS_trigger) do NOT trigger this rule.
+    """
+    if ctx.action != "inject_css":
+        return False
+
+    css = ctx.payload.get("css", "").lower()
+    if not css:
+        return False
+
+    # Only fire when CSS targets selectors KNOWN to be inside an iframe.
+    # These are elements that live inside #BIS_frame's contentDocument:
+    iframe_interior_selectors = (
+        "#bis_frame",           # Targeting the iframe itself (CSS can't style its contents)
+        ".bis-modal",           # The modal container inside the iframe
+        ".bis-content",         # Content wrapper inside iframe
+        ".bis-form",            # Form inside iframe
+        "#bis-email",           # Email input inside iframe
+        ".bis-submit",          # Submit button inside iframe
+        "#bis-popup",           # Popup inside iframe
+        ".bis_modal",           # Alternate naming
+        "iframe#bis",           # Direct iframe targeting
+        "#backinstockform",     # BIS form inside iframe
+    )
+
+    # Check if any of the CSS selectors target iframe-interior elements
+    return any(sel in css for sel in iframe_interior_selectors)
+
+
+@_rule(
+    tag="context_available_after_diagnose",
+    hint=(
+        "⛔ MANDATORY: You just ran diagnose and product context files are available, but you "
+        "haven't searched them yet. Run `search_context` NOW with the product/app name "
+        "(e.g., 'BIS', 'back in stock', 'slide cart', 'modal', 'iframe'). "
+        "Context files contain CRITICAL info like: BIS modal renders inside #BIS_frame iframe "
+        "(inject_css won't work!), exact CSS selectors, scoping rules, and known fix patterns. "
+        "Skipping this step is the #1 cause of wasted turns. DO IT NOW before any fix attempt."
+    ),
+    cooldown=6,
+    priority=10,
+)
+def _context_available_after_diagnose(ctx: _RuleContext) -> bool:
+    """Nudge AI to search context right after diagnose, before it starts fixing."""
+    if ctx.action != "diagnose":
+        return False
+    if ctx.context_searched:
+        return False
+    import os
+    if not os.path.isdir("context") or not any(f.endswith(".md") for f in os.listdir("context")):
+        return False
+    return True
+
+
 # ─── Fix Attempt Guidance ─────────────────────────────────────────
 
 @_rule(
@@ -355,7 +554,15 @@ def _css_before_js(ctx: _RuleContext) -> bool:
     if ctx.action != "inject_js":
         return False
     # Only fire if no inject_css has been used yet
-    return "inject_css" not in ctx.actions_used
+    if "inject_css" in ctx.actions_used:
+        return False
+    # DON'T fire if the JS targets an iframe — inject_css CANNOT reach inside iframes,
+    # so inject_js is the ONLY correct approach (e.g., BIS modal inside #BIS_frame)
+    code = ctx.payload.get("code", "").lower()
+    iframe_signals = ("contentdocument", "contentwindow", "bis_frame", "iframe", "bismodal")
+    if any(sig in code for sig in iframe_signals):
+        return False
+    return True
 
 
 @_rule(
@@ -385,6 +592,31 @@ def _fix_without_verify(ctx: _RuleContext) -> bool:
             last_verify_idx = i
     # Fire only if there was a previous inject and no run_test after it
     return prev_inject_idx >= 0 and last_verify_idx < prev_inject_idx
+
+
+@_rule(
+    tag="must_verify_before_report",
+    hint=(
+        "⛔ STOP — You MUST run `verify_fix` before reporting to the user. "
+        "verify_fix is a comprehensive subagent that runs REAL browser checks on ALL your fixes: "
+        "computed styles, element visibility, dimensions, iframe state, and regressions. "
+        "It's the final quality gate — without it, you might report a broken fix. "
+        "Call `verify_fix` NOW. If it fails, go back and fix the issues before reporting."
+    ),
+    cooldown=2,
+    priority=11,  # Highest priority — blocks reporting
+)
+def _must_verify_before_report(ctx: _RuleContext) -> bool:
+    """Fires when AI tries to report/build_report without running verify_fix first."""
+    if ctx.action not in ("post_message", "answer_user", "build_report"):
+        return False
+    # Don't fire if no fixes were applied (nothing to verify)
+    fix_actions = {"inject_css", "inject_js"}
+    has_fixes = any(a in fix_actions for a in ctx.actions_used)
+    if not has_fixes:
+        return False
+    # Fire if verify_fix hasn't been run
+    return not ctx.verify_fix_done
 
 
 @_rule(
@@ -525,6 +757,78 @@ def _selector_not_found(ctx: _RuleContext) -> bool:
     if ctx.action not in ("click", "hover", "inspect_element", "capture_element", "type"):
         return False
     return "not found" in ctx.result_str.lower()
+
+
+# ─── Progressive Task Completion ─────────────────────────────────
+
+@_rule(
+    tag="complete_task_before_moving_on",
+    hint=(
+        "⚠️ PROGRESSIVE COMPLETION: You just finished work on a task but didn't mark it complete. "
+        "You MUST call `update_plan` with `complete` + `findings` for the current task BEFORE "
+        "starting the next action. Batch-completing at the end wastes turns — the completion gate "
+        "will BLOCK your post_message and force you to go back. Mark tasks done AS YOU GO."
+    ),
+    cooldown=3,
+    priority=10,
+)
+def _complete_task_before_moving_on(ctx: _RuleContext) -> bool:
+    """Fire when AI does a new investigative/fix action without completing the previous task.
+
+    Detects pattern: AI did run_test (verification) → then starts a new action
+    that isn't update_plan (meaning it skipped marking the task complete).
+    """
+    if ctx.action == "update_plan":
+        return False  # They're doing the right thing
+    if ctx.action in ("observe", "post_message", "answer_user"):
+        return False  # Not a new task action
+
+    # Check if the last non-observe action before this was run_test (verification complete)
+    # and the action before that was inject_css/inject_js (a fix was applied)
+    recent = ctx.actions_used[:-1]  # Exclude current action
+    if len(recent) < 2:
+        return False
+
+    # Walk backwards past any observes
+    last_meaningful = None
+    second_last = None
+    for a in reversed(recent):
+        if a == "observe":
+            continue
+        if last_meaningful is None:
+            last_meaningful = a
+        elif second_last is None:
+            second_last = a
+            break
+
+    if last_meaningful is None or second_last is None:
+        return False
+
+    # Pattern: fix → verify → [not update_plan] = forgot to complete task
+    fix_actions = {"inject_css", "inject_js", "click", "scroll", "type", "hover"}
+    verify_actions = {
+        "run_test", "inspect_element", "cdp_get_computed_style",
+        "cdp_get_matched_styles", "cdp_get_event_listeners", "search_all_frames", "cdp_get_network_details"
+    }
+
+    if second_last in fix_actions and last_meaningful in verify_actions:
+        return True
+
+    # Also fire if we see 3+ actions since the last update_plan and none of them is update_plan
+    actions_since_plan = []
+    for a in reversed(ctx.actions_used[:-1]):
+        if a == "update_plan":
+            break
+        actions_since_plan.append(a)
+
+    # If 5+ actions without any plan update, and at least one was a fix+verify
+    if len(actions_since_plan) >= 5:
+        has_fix = any(a in fix_actions for a in actions_since_plan)
+        has_verify = any(a in verify_actions for a in actions_since_plan)
+        if has_fix and has_verify:
+            return True
+
+    return False
 
 
 # ─── Task Completion / Runaway Prevention ─────────────────────────
@@ -847,6 +1151,35 @@ def _overlay_blocking(ctx: _RuleContext) -> bool:
     cooldown=10,
     priority=10,
 )
+def _close_overlay_before_continue(ctx: _RuleContext) -> bool:
+    """Fires specifically when the slim_obs shows potential overlay in DOM.
+
+    Looks at the slim observation for drawer/modal/overlay keywords in
+    the DOM summary — if present AND the AI has been struggling, fire.
+    """
+    if ctx.turn < 4:
+        return False
+
+    slim = ctx.slim_obs
+    if not slim:
+        return False
+
+    # Check DOM for overlay-related content
+    dom_summary = str(slim.get("dom", "")).lower()
+    overlay_keywords = ("drawer", "modal", "overlay", "cart-drawer", "slide-in",
+                        "popup", "lightbox", "cart_drawer")
+    has_overlay_in_dom = any(kw in dom_summary for kw in overlay_keywords)
+
+    if not has_overlay_in_dom:
+        return False
+
+    # Only fire if AI seems stuck (3+ non-click actions recently)
+    recent = ctx.actions_used[-4:] if len(ctx.actions_used) >= 4 else ctx.actions_used
+    non_interactive = [a for a in recent if a in ("run_test", "search_dom", "observe", "inspect_element")]
+    return len(non_interactive) >= 3
+
+
+# ── Rule: Use browser interaction instead of just run_test ──────────────
 @_rule(
     tag="create_plan_first",
     hint=(
@@ -865,35 +1198,59 @@ def _create_plan_first(ctx: _RuleContext) -> bool:
     return "update_plan" not in ctx.actions_used
 
 
-def _close_overlay_before_continue(ctx: _RuleContext) -> bool:
-    """Fires specifically when the slim_obs shows potential overlay in DOM.
+# ─── Guidance moved from system prompt → JIT ────────────────────
 
-    Looks at the slim observation for drawer/modal/overlay keywords in
-    the DOM summary — if present AND the AI has been struggling, fire.
-    """
-    if ctx.turn < 4:
+@_rule(
+    tag="console_error_verification",
+    hint=(
+        "⚠️ CONSOLE ERROR VERIFICATION: Diagnose found SUSPICIOUS console errors — they may be "
+        "planted or misleading. Do NOT trust them blindly. Cross-reference each error with the DOM: "
+        "1) Does the referenced script/module appear in obs_dom.txt `📜 [script]` entries? "
+        "2) Can you reproduce the error by interacting with the element? "
+        "3) Does the error correlate with a failed network request? "
+        "Only trust errors classified as 'real' (JS exceptions, resource failures). "
+        "Suspicious errors need DOM evidence before acting on them."
+    ),
+    cooldown=8,
+    priority=9,
+)
+def _console_error_verification(ctx: _RuleContext) -> bool:
+    """Fires after diagnose when suspicious console errors are found."""
+    if ctx.action != "diagnose":
         return False
+    rd = ctx.result_dict
+    classification = rd.get("console_error_classification", {})
+    return classification.get("total_suspicious", 0) > 0
 
-    slim = ctx.slim_obs
-    if not slim:
+
+
+@_rule(
+    tag="delivering_fix_format",
+    hint=(
+        "⚠️ REPORT FORMAT: Your post_message MUST include ALL of these:\n"
+        "1) **Root Cause** — what was broken and why\n"
+        "2) **Fix Code** — the exact CSS or JS that fixes it (ready to copy-paste)\n"
+        "3) **Where to Implement** — which theme file, section, or app setting\n"
+        "4) Last line MUST be: `Type Summarize to save fixes, then End to close.`\n"
+        "If any section is missing, the merchant can't act on your fix. Include all four."
+    ),
+    cooldown=3,
+    priority=10,
+)
+def _delivering_fix_format(ctx: _RuleContext) -> bool:
+    """Fires on post_message to ensure the report has the required format."""
+    if ctx.action != "post_message":
         return False
-
-    # Check DOM summary for overlay-related content
-    dom_summary = str(slim.get("dom_summary", "")).lower()
-    overlay_keywords = ("drawer", "modal", "overlay", "cart-drawer", "slide-in",
-                        "popup", "lightbox", "cart_drawer")
-    has_overlay_in_dom = any(kw in dom_summary for kw in overlay_keywords)
-
-    if not has_overlay_in_dom:
-        return False
-
-    # Only fire if AI seems stuck (3+ non-click actions recently)
-    recent = ctx.actions_used[-4:] if len(ctx.actions_used) >= 4 else ctx.actions_used
-    non_interactive = [a for a in recent if a in ("run_test", "search_dom", "observe", "inspect_element")]
-    return len(non_interactive) >= 3
+    msg = ctx.payload.get("message", "").lower()
+    has_root_cause = "root cause" in msg or "cause:" in msg or "problem:" in msg
+    has_fix_code = "```" in msg or "inject_css" in msg or "inject_js" in msg or "css" in msg
+    has_where = "theme" in msg or "implement" in msg or "file" in msg or "section" in msg or "setting" in msg
+    has_closing = "summarize" in msg or "end to close" in msg
+    # Fire if missing 2+ required sections
+    missing = sum(1 for x in [has_root_cause, has_fix_code, has_where, has_closing] if not x)
+    return missing >= 2
 
 
-# ── Rule: Use browser interaction instead of just run_test ──────────────
 @_rule(
     tag="interact_dont_just_test",
     hint=(
@@ -958,3 +1315,165 @@ def _verify_without_interact(ctx: _RuleContext) -> bool:
     has_interaction = any(a in browser_actions for a in actions_since_fix)
 
     return not has_interaction
+
+
+# ── Rule: Block layout collapse via body resizing ────────────────────────
+@_rule(
+    tag="block_body_resizing",
+    hint=(
+        "⚠️ CRITICAL: Viewport/body width CSS/JS overrides that collapse layouts are prohibited. "
+        "Do NOT write CSS targeting body/html width or JS modifying document.body.style.width. "
+        "If you need to test responsive styles, use proper Playwright viewport commands. "
+        "Resizing via CSS/JS breaks layout media queries and causes validation timeouts."
+    ),
+    cooldown=5,
+    priority=10,
+)
+def _block_body_resizing(ctx: _RuleContext) -> bool:
+    """Fires when the agent attempts to modify body or html width in CSS/JS."""
+    if ctx.action == "inject_css":
+        css = ctx.payload.get("css") or ctx.payload.get("code") or ""
+        normalized = re.sub(r'\s+', ' ', css).lower()
+        if re.search(r'\b(body|html)\b\s*\{[^}]*\b(width|min-width|max-width)\b', normalized):
+            return True
+    elif ctx.action == "inject_js":
+        code = ctx.payload.get("code") or ""
+        normalized = re.sub(r'\s+', ' ', code).lower()
+        if (
+            "body.style.width" in normalized
+            or "body.style.minwidth" in normalized
+            or "body.style.maxwidth" in normalized
+            or "html.style.width" in normalized
+            or "html.style.minwidth" in normalized
+            or "html.style.maxwidth" in normalized
+            or "body.style =" in normalized
+            or "html.style =" in normalized
+            or re.search(r'\b(body|html)\.style\b', normalized) and re.search(r'\b(width|minwidth|maxwidth)\b', normalized)
+            or re.search(r'queryselector\(\s*[\'"](body|html)[\'"]\s*\)\.style', normalized)
+            or re.search(r'style\.setproperty\(\s*[\'"](min-|max-)?width[\'"]', normalized)
+            or re.search(r'setattribute\(\s*[\'"]style[\'"]\s*,\s*[\'"][^\'"]*\b(width|min-width|max-width)\b', normalized)
+        ):
+            return True
+    # Or if the action result contains the rejection error message
+    if "[error] Action rejected: Modifying the width of <body>" in ctx.result_str:
+        return True
+    return False
+
+
+# ── Rule: Select element value assigned plain text instead of option value ─
+@_rule(
+    tag="select_value_plain_text",
+    hint=(
+        "⚠️ WARNING: You are setting a select element's `.value` to a plain text string (e.g. 'Dawn'). "
+        "In Shopify (and many other systems), the `<option>` value is a Variant ID or GID "
+        "(e.g., 'gid://shopify/ProductVariant/44426573807802' or '44426573807802'), not the option's text. "
+        "Find the option by its text content first, then select it by setting `.value = option.value` "
+        "and dispatching the change/input events. Example:\n"
+        "```js\n"
+        "const select = document.querySelector('select');\n"
+        "const option = Array.from(select.options).find(opt => opt.text.trim().toLowerCase() === selectedColor.toLowerCase());\n"
+        "if (option) {\n"
+        "  select.value = option.value;\n"
+        "  select.dispatchEvent(new Event('change', { bubbles: true }));\n"
+        "}\n"
+        "```"
+    ),
+    cooldown=4,
+    priority=9,
+)
+def _select_value_plain_text(ctx: _RuleContext) -> bool:
+    """Fires when JS code assigns a plain text literal to a select or option value."""
+    if ctx.action != "inject_js":
+        return False
+    code = ctx.payload.get("code") or ""
+    # Look for .value = 'Plain Text' or .value = "Plain Text"
+    # Matches letters and spaces, but not GIDs (no slashes, no colons, not pure digits)
+    matches = re.findall(r'\.value\s*=\s*[\'"]([a-zA-Z\s_-]{3,20})[\'"]', code)
+    if matches:
+        return True
+    
+    # Also search for select/option value setting text
+    if "select.value =" in code or "option.value =" in code:
+        # If they are assigning variant/color names
+        color_keywords = {"dawn", "ice", "powder", "electric", "sunset", "color", "variant", "size"}
+        code_lower = code.lower()
+        if any(f"value = '{cw}'" in code_lower or f'value = "{cw}"' in code_lower for cw in color_keywords):
+            return True
+    return False
+
+
+# ── Rule: Verify selectors before CSS injection ──────────────────────────
+@_rule(
+    tag="verify_selectors_before_css",
+    hint=(
+        "⚠️ SELECTOR VALIDATION: Ensure your CSS selectors are accurate! "
+        "Before injecting CSS/JS fixes, always query the selector first via `cdp_query_selector_all` "
+        "or `run_test` (e.g. `document.querySelector('your-selector')`) to confirm it exists. "
+        "Never assume class names from visual inspection alone. For example, a widget might use "
+        "`.amp-bundles__volume-discount-bundles__tier-option` rather than a generic `.volume-discount-tier`."
+    ),
+    cooldown=5,
+    priority=8,
+)
+def _verify_selectors_before_css(ctx: _RuleContext) -> bool:
+    """Fires when CSS is injected, to remind the agent to validate selectors."""
+    if ctx.action != "inject_css":
+        return False
+    # If the agent has not used cdp_query_selector_all or inspect_element recently (in the last 4 turns)
+    recent = ctx.actions_used[-4:] if len(ctx.actions_used) >= 4 else ctx.actions_used
+    has_checked_selector = any(a in ("cdp_query_selector_all", "inspect_element", "run_test") for a in recent)
+    return not has_checked_selector
+
+
+# ── Rule: Update plan warning ──────────────────────────────────────────
+@_rule(
+    tag="update_plan_warning",
+    hint=(
+        "⚠️ PLAN WARNING/ERROR: Your `update_plan` call returned a validation warning or error. "
+        "Please check your task indexes/IDs carefully! Ensure you are marking the correct task "
+        "ID as complete or in-progress, and that you are not completing a fix/verify task "
+        "without actually having taken the corresponding actions in this session."
+    ),
+    cooldown=2,
+    priority=10,
+)
+def _update_plan_warning(ctx: _RuleContext) -> bool:
+    """Fires when update_plan returns an error or warning."""
+    if ctx.action != "update_plan":
+        return False
+    rd = ctx.result_dict
+    if rd:
+        # Check for error/warning keys
+        if any(k in rd for k in ("error", "errors", "warnings", "⚠️_warning")):
+            return True
+    # Fallback to checking result string
+    res_str = ctx.result_str.lower()
+    if "error" in res_str or "warning" in res_str or "invalid" in res_str or "invalid index" in res_str:
+        return True
+    return False
+
+
+# ── Rule: Resilient clicking instead of JS click injection ───────────────
+@_rule(
+    tag="resilient_clicking",
+    hint=(
+        "⚠️ RESILIENT CLICKING: Avoid writing programmatic click injections (e.g. `.click()`) in `inject_js` "
+        "when a selector-based click is intercepted by overlays or sticky headers. "
+        "Instead, retrieve the element's coordinates using `cdp_query_selector_all` or `inspect_element` "
+        "and click via the coordinate-based `click_at_position(x, y)` tool. This is more robust and behaves "
+        "like a real user interaction."
+    ),
+    cooldown=4,
+    priority=9,
+)
+def _resilient_clicking(ctx: _RuleContext) -> bool:
+    """Fires when JS code contains .click() or similar click injection."""
+    if ctx.action != "inject_js":
+        return False
+    code = ctx.payload.get("code") or ""
+    # Look for ".click(" or ".click;" or similar click calls in the JS code
+    if ".click(" in code or ".click;" in code or "click()" in code:
+        return True
+    return False
+
+

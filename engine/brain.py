@@ -18,12 +18,13 @@ from browser.observer import capture_observation
 from browser.actions import execute_action
 from ai.client import AIClient
 from ai.summarizer import SummarizerClient
+from ai.subagent import InvestigateSubagent, VerifyFixSubagent, BuildReportSubagent, CompressHistorySubagent, API_CALL_BUFFER
 from ai.prompts import get_system_prompt
 from engine.diagnostics import cross_reference_diagnostics
 from engine.search import search_dom, search_console, search_network, read_network_body
-from engine.kb import append_fix, search_fixes, search_playbook, find_relevant_fixes
+from engine.kb import append_fix, search_fixes, search_playbook, find_relevant_fixes, search_context
 from engine.convo_logger import ConvoLogger, copy_fix_to_clipboard, search_conversations, get_conversation_detail
-from engine.jit import JITEngine
+from engine.jit import JITEngine, _ALL_RULES
 
 console = Console()
 SCRATCH_DIR = "scratch"
@@ -33,8 +34,13 @@ SCRATCH_NET_BODIES = os.path.join(SCRATCH_DIR, "obs_net_bodies")
 LOCAL_ACTIONS = {
     "search_dom", "search_console", "search_network",
     "read_network_body", "diagnose", "log_fix",
-    "search_playbook", "search_fixes", "search_conversations",
+    "search_playbook", "search_fixes", "search_context", "search_conversations",
     "get_conversation_detail", "update_plan",
+}
+
+# Subagent actions — async AI calls, handled separately from LOCAL_ACTIONS
+SUBAGENT_ACTIONS = {
+    "investigate", "verify_fix", "build_report",
 }
 
 # Session commands (case-insensitive)
@@ -101,6 +107,15 @@ class Brain:
         self.browser = BrowserController(headless=config.headless)
         self.ai = AIClient(config)
         self.summarizer = SummarizerClient(config)
+
+        # Subagents — specialized AI workers for targeted analysis
+        self.sub_investigate = InvestigateSubagent(config)
+        self.sub_verify_fix = VerifyFixSubagent(config)
+        self.sub_build_report = BuildReportSubagent(config)
+        self.sub_compress = CompressHistorySubagent(config)
+
+        # Structured session log
+        self._session_log: list[dict] = []
         self.messages: list[dict] = []  # Conversation history for the AI
         self.fix_attempts: list[dict] = []
         self.turn_count = 0
@@ -111,13 +126,18 @@ class Brain:
         self._fix_copy_offered = False  # Track if copy hint was shown for current fix
         self._summarize_done = False  # Track if user ran 'summarize' command
         self._recent_actions: list[tuple] = []  # Track (action, payload_key) for loop detection
+        self._action_history: list[str] = []   # Track history of all action names executed
         self._consecutive_errors = 0  # Circuit breaker for non-retryable API errors
         self._consecutive_passive_turns = 0  # Track turns without progress (no click/inject/post_message/navigate)
         self._consecutive_fix_turns = 0  # Track consecutive inject_css/inject_js without verification
+        self._verify_fix_passed = False  # Hard gate — must pass verify_fix before post_message
+        self._failed_verify_attempts = 0
+        self._verify_gate_override = False
         self._prev_obs_stats: dict | None = None  # Previous observation stats for diff tracking
         self._plan: list[dict] = []  # Persistent task plan: [{task, status, findings}]
         self.jit = JITEngine()  # Just-In-Time contextual hint engine
         self.multimodal = config.multimodal  # True = send screenshots, False = text-only
+        self._current_payload = {}  # Stored for action log payload preview
         self.system_prompt = get_system_prompt(self.multimodal)
 
         # Conversation logger — saves session to convo/ on exit
@@ -225,6 +245,7 @@ class Brain:
                 "diagnose": "🔍", "search_dom": "🔍", "search_console": "🔍",
                 "search_network": "🔍", "search_playbook": "📖", "search_fixes": "📖",
                 "search_conversations": "📖", "get_conversation_detail": "📖",
+                "search_context": "📖",
                 "inject_css": "🔧", "inject_js": "🔧",
                 "click": "👆", "type": "⌨️", "scroll": "📜", "hover": "👆",
                 "navigate": "🌐", "observe": "👁️", "run_test": "✅",
@@ -236,9 +257,15 @@ class Brain:
                 "cdp_get_dom_tree": "🔬", "cdp_get_cookies": "🍪",
                 "cdp_get_computed_style": "🔬", "cdp_get_page_metrics": "📊",
                 "cdp_query_selector_all": "🔬",
+                "cdp_get_matched_styles": "🔬", "cdp_get_event_listeners": "🔬",
+                "search_all_frames": "🔬", "cdp_get_network_details": "📡",
+                "investigate": "🕵️", "verify_fix": "✅", "build_report": "📋",
             }
             icon = action_icons.get(content, "▶️")
             console.print(f"  {icon} [bold]{content}[/bold]")
+            # Show payload preview for the action
+            if hasattr(self, '_current_payload') and self._current_payload:
+                self._print_payload_preview(content, self._current_payload)
 
         elif msg_type == "result":
             self._print_compact_result(content)
@@ -253,8 +280,10 @@ class Brain:
             self._offer_copy_fix(content)
 
         elif msg_type == "status":
-            if "Turn" in str(content):
+            if "═══ Turn" in str(content):
                 console.print(f"\n[bold cyan]{content}[/bold cyan]")
+            elif "⚠️" in str(content) or "❌" in str(content):
+                console.print(f"  [bold yellow]{content}[/bold yellow]")
             else:
                 console.print(f"  [dim]{content}[/dim]")
 
@@ -265,34 +294,189 @@ class Brain:
             console.print(f"  [{msg_type}] {content}")
 
     def _print_compact_result(self, content):
-        """Print a compact, readable summary of action results instead of raw JSON."""
-        if isinstance(content, dict):
-            if "detected_scenario" in content:
-                scenario = content.get("detected_scenario", "unknown")
-                conf = content.get("confidence", 0)
-                issues = content.get("potential_issues", [])
-                console.print(f"  [dim]Scenario: {scenario} ({conf}% confidence)[/dim]")
-                for issue in issues[:3]:
-                    short = issue[:80] + "..." if len(issue) > 80 else issue
-                    console.print(f"  [dim]  • {short}[/dim]")
-            elif "total_matches" in content:
-                total = content.get("total_matches", 0)
-                query = content.get("query", "")
-                console.print(f"  [dim]Found {total} matches for \"{query}\"[/dim]")
-            elif "results" in content:
-                results = content.get("results", [])
-                console.print(f"  [dim]Found {len(results)} result(s)[/dim]")
-            elif isinstance(content.get("matches"), list):
-                matches = content.get("matches", [])
-                console.print(f"  [dim]Found {len(matches)} past session(s)[/dim]")
+        """Print a compact, readable summary of action results instead of raw JSON.
+
+        Purely cosmetic — must NEVER crash the session.
+        """
+        try:
+            if isinstance(content, dict):
+                if "detected_scenario" in content:
+                    scenario = content.get("detected_scenario", "unknown")
+                    conf = content.get("confidence", 0)
+                    issues = content.get("potential_issues", [])
+                    has_context = "context_files_available" in content
+                    next_step = content.get("⚠️_NEXT_STEP", "")
+                    console.print(f"  [dim]Scenario: {scenario} ({conf}% confidence)[/dim]")
+                    if has_context:
+                        console.print(f"  [bold cyan]📚 Product context loaded from context/ files[/bold cyan]")
+                    for issue in issues[:5]:
+                        short = str(issue)[:150] + "..." if len(str(issue)) > 150 else str(issue)
+                        console.print(f"  [dim]  • {short}[/dim]")
+                    if next_step:
+                        console.print(f"  [bold yellow]⚠️ NEXT STEP: {next_step}[/bold yellow]")
+                elif "total_matches" in content:
+                    total = content.get("total_matches", 0)
+                    query = content.get("query", "")
+                    console.print(f"  [dim]Found {total} matches for \"{query}\"[/dim]")
+                elif "results" in content:
+                    results = content.get("results", [])
+                    console.print(f"  [dim]Found {len(results)} result(s)[/dim]")
+                elif isinstance(content.get("matches"), list):
+                    matches = content.get("matches", [])
+                    if matches and isinstance(matches[0], dict) and "file" in matches[0]:
+                        files = sorted(set(str(m.get("file", "?")) for m in matches))
+                        files_str = ", ".join(files[:3])
+                        console.print(f"  [bold cyan]📚 Found {len(matches)} context match(es) from: {files_str}[/bold cyan]")
+                    else:
+                        console.print(f"  [dim]Found {len(matches)} past session(s)[/dim]")
+                elif "plan" in content:
+                    # update_plan result — already displayed via _display_plan
+                    pass
+                elif "success" in content and "message" in content:
+                    # run_test result — show pass/fail + data preview
+                    passed = content.get("success", False)
+                    data = content.get("data", content.get("result", content.get("message", "")))
+                    icon = "✅" if passed else "❌"
+                    data_str = str(data)[:200] + "..." if len(str(data)) > 200 else str(data)
+                    console.print(f"  [dim]{icon} run_test {'passed' if passed else 'FAILED'}: {data_str}[/dim]")
+                elif "report" in content:
+                    # build_report result
+                    report = str(content["report"])
+                    console.print(f"  [bold green]📋 Report generated ({len(report)} chars)[/bold green]")
+                elif "passed" in content:
+                    # verify_fix result
+                    passed = content.get("passed", False)
+                    conf = content.get("confidence", 0)
+                    icon = "✅" if passed else "❌"
+                    console.print(f"  {icon} verify_fix: {'PASSED' if passed else 'FAILED'} ({conf}% confidence)")
+                    checks = content.get("checks", [])
+                    for chk in checks[:5]:
+                        chk_icon = "✅" if chk.get("passed") else "❌"
+                        console.print(f"    {chk_icon} {chk.get('what', '?')}: {chk.get('actual', '?')}")
+                elif "scenario" in content and "critical_info" in content:
+                    # investigate result
+                    scenario = content.get("scenario", "unknown")
+                    conf = content.get("confidence", 0)
+                    console.print(f"  [bold cyan]🕵️ Investigation: {scenario} ({conf}% confidence)[/bold cyan]")
+                    for info in content.get("critical_info", [])[:3]:
+                        console.print(f"    [cyan]• {str(info)[:150]}[/cyan]")
+                    approach = content.get("recommended_approach", "")
+                    if approach:
+                        console.print(f"    [bold]Approach: {str(approach)[:200]}[/bold]")
+                elif "error" in content:
+                    console.print(f"  [bold red]❌ Error: {str(content['error'])[:200]}[/bold red]")
+                else:
+                    keys = list(content.keys())[:5]
+                    console.print(f"  [dim]Result: {', '.join(str(k) for k in keys)}[/dim]")
+            elif isinstance(content, str):
+                short = content[:200] + "..." if len(content) > 200 else content
+                console.print(f"  [dim]{short}[/dim]")
             else:
-                keys = list(content.keys())[:5]
-                console.print(f"  [dim]Result: {', '.join(keys)}[/dim]")
-        elif isinstance(content, str):
-            short = content[:120] + "..." if len(content) > 120 else content
-            console.print(f"  [dim]{short}[/dim]")
-        else:
-            console.print(f"  [dim]Done.[/dim]")
+                console.print(f"  [dim]Done.[/dim]")
+        except Exception:
+            console.print(f"  [dim]Result logged.[/dim]")
+
+    def _print_payload_preview(self, action: str, payload: dict):
+        """Print a compact preview of the action's payload for debug visibility.
+
+        This is purely cosmetic logging — must NEVER crash the session.
+        """
+        try:
+            preview = ""
+            if action in ("search_dom", "search_console", "search_network",
+                           "search_playbook", "search_fixes", "search_context", "search_conversations"):
+                preview = f'query="{payload.get("query", "")}"'
+            elif action in ("click", "hover", "inspect_element", "capture_element"):
+                preview = f'selector="{payload.get("selector", "")}"'
+            elif action == "inject_css":
+                code = str(payload.get("css", payload.get("code", "")))
+                preview = f"css={code[:100]}..." if len(code) > 100 else f"css={code}"
+            elif action == "inject_js":
+                code = str(payload.get("code", ""))
+                preview = f"js={code[:100]}..." if len(code) > 100 else f"js={code}"
+            elif action == "navigate":
+                preview = f'url="{payload.get("url", "")}"'
+            elif action == "run_test":
+                code = str(payload.get("code", ""))
+                preview = f"test={code[:100]}..." if len(code) > 100 else f"test={code}"
+            elif action == "type":
+                preview = f'selector="{payload.get("selector", "")}" text="{str(payload.get("text", ""))[:50]}"'
+            elif action == "scroll":
+                preview = f'x={payload.get("x", 0)} y={payload.get("y", 0)}'
+            elif action == "click_at_position":
+                preview = f'x={payload.get("x", "")} y={payload.get("y", "")}'
+            elif action in ("cdp_get_computed_style", "cdp_query_selector_all", "cdp_get_matched_styles", "cdp_get_event_listeners", "search_all_frames"):
+                preview = f'selector="{payload.get("selector", "")}"'
+            elif action == "cdp_get_network_details":
+                preview = f'urlPattern="{payload.get("urlPattern", "")}"'
+            elif action == "update_plan":
+                if payload.get("tasks"):
+                    tasks = payload["tasks"]
+                    task_names = [str(t)[:30] for t in tasks[:3]]
+                    preview = f"{len(tasks)} task(s): {', '.join(task_names)}"
+                elif payload.get("complete") is not None:
+                    findings = str(payload.get("findings", ""))[:60]
+                    preview = f'complete task #{payload["complete"]}: {findings}'
+                elif payload.get("complete_all"):
+                    batch = payload["complete_all"]
+                    preview = f'batch-complete {len(batch)} task(s)'
+                elif payload.get("skip") is not None:
+                    preview = f'skip task #{payload["skip"]}'
+                elif payload.get("in_progress") is not None:
+                    preview = f'in_progress task #{payload["in_progress"]}'
+                elif payload.get("add"):
+                    preview = f'add task: {str(payload["add"])[:60]}'
+            elif action == "read_network_body":
+                preview = f'filename="{payload.get("filename", "")}"'
+            elif action == "get_conversation_detail":
+                preview = f'filename="{payload.get("filename", "")}"'
+            elif action == "investigate":
+                preview = f'query="{payload.get("query", "")}"'
+            elif action == "verify_fix":
+                preview = f'fix_action="{payload.get("fix_action", "last")}"'
+            elif action == "build_report":
+                preview = "compiling report from session data"
+
+            if preview:
+                console.print(f"    [dim italic]{preview}[/dim italic]")
+        except Exception:
+            pass  # Never crash on cosmetic logging
+
+    def _print_jit_debug(self, jit_hints: list[str]):
+        """Print JIT evaluation debug info + hints.
+
+        Purely cosmetic — must NEVER crash the session.
+        """
+        try:
+            debug = self.jit.get_last_eval_debug()
+            if not debug:
+                return
+
+            fired = debug.get("fired", [])
+            on_cooldown = debug.get("on_cooldown", [])
+            errored = debug.get("errored", [])
+
+            # Show fired rules
+            if jit_hints:
+                for hint in jit_hints:
+                    hint_short = hint[:250] + "..." if len(hint) > 250 else hint
+                    console.print(f"  [bold yellow]💡 {hint_short}[/bold yellow]")
+
+            # Show cooldown summary (compact — just count + names of high-priority ones on cooldown)
+            if on_cooldown:
+                high_pri_cd = [tag for tag, remaining in on_cooldown
+                               if any(r.tag == tag and r.priority >= 8 for r, _ in _ALL_RULES)]
+                if high_pri_cd:
+                    cd_str = ", ".join(high_pri_cd[:5])
+                    console.print(f"  [dim]⏳ On cooldown ({len(on_cooldown)} rules): {cd_str}[/dim]")
+                else:
+                    console.print(f"  [dim]⏳ {len(on_cooldown)} rules on cooldown[/dim]")
+
+            # Show errored rules (important for debugging broken rules)
+            for tag, err in errored:
+                console.print(f"  [red]❌ JIT rule '{tag}' errored: {err}[/red]")
+        except Exception:
+            pass  # Never crash on cosmetic logging
 
     def _extract_code_from_message(self, message: str) -> str | None:
         """Extract the largest code block from a message. Returns code or None."""
@@ -360,9 +544,28 @@ class Brain:
         """The main observe → think → act → repeat loop."""
         while True:
             self.turn_count += 1
-            await self._log("status", f"═══ Turn {self.turn_count} ═══")
+            # Enhanced turn header with engine state
+            plan_done = sum(1 for t in self._plan if t["status"] == "done")
+            plan_total = len(self._plan)
+            jit_state = self.jit.get_state_summary()
+            flags = []
+            if jit_state["diagnose_done"]:
+                flags.append("diag✓")
+            if jit_state["context_searched"]:
+                flags.append("ctx✓")
+            if jit_state["playbook_searched"]:
+                flags.append("pb✓")
+            if jit_state["fixes_searched"]:
+                flags.append("fx✓")
+            if jit_state["cdp_any_used"]:
+                flags.append("cdp✓")
+            flag_str = " ".join(flags) if flags else "no flags"
+            scenario_str = f" | scenario={self.detected_scenario}" if self.detected_scenario else ""
+            plan_str = f" | plan={plan_done}/{plan_total}" if plan_total else ""
+            msgs_str = f" | msgs={len(self.messages)}"
+            await self._log("status", f"═══ Turn {self.turn_count} ═══  [{flag_str}{scenario_str}{plan_str}{msgs_str}]")
 
-            self._trim_history()
+            await self._trim_history()
 
             # Capture observation — robust against browser crashes
             try:
@@ -382,7 +585,16 @@ class Brain:
             # Get action from AI
             try:
                 # Fresh screenshot from this turn's observation
-                screenshot_for_ai = obs["screenshot_base64"] if self.multimodal else None
+                # Skip screenshot if recovering from 400 context overflow
+                if getattr(self, "_skip_screenshot_next_turn", False):
+                    screenshot_for_ai = None
+                    self._skip_screenshot_next_turn = False
+                    console.print(f"  [yellow]📷 Screenshot skipped (400 recovery — text-only this turn)[/yellow]")
+                else:
+                    screenshot_for_ai = obs["screenshot_base64"] if self.multimodal else None
+
+                # Buffer before main agent API call (rate limit protection)
+                await asyncio.sleep(API_CALL_BUFFER)
 
                 # Show thinking spinner while waiting for AI
                 from rich.live import Live
@@ -395,6 +607,25 @@ class Brain:
                     )
                 await self._log("thought", action_data.get("thought", ""))
 
+                # Show AI response metadata (timing, tokens, model)
+                meta = action_data.get("_meta", {})
+                if meta:
+                    elapsed = meta.get("elapsed_s", "?")
+                    model = meta.get("model", "?")
+                    prompt_t = meta.get("prompt_tokens")
+                    comp_t = meta.get("completion_tokens")
+                    total_t = meta.get("total_tokens")
+                    token_str = f" | tokens={prompt_t}+{comp_t}={total_t}" if total_t else ""
+                    console.print(f"  [dim]⚡ {elapsed}s | model={model}{token_str}[/dim]")
+                    # Log to structured session log
+                    self._log_session_event("main_agent_call", {
+                        "elapsed_s": elapsed,
+                        "model": model,
+                        "prompt_tokens": prompt_t,
+                        "completion_tokens": comp_t,
+                        "total_tokens": total_t,
+                    })
+
                 # Reset error counter on success
                 self._consecutive_errors = 0
 
@@ -402,19 +633,51 @@ class Brain:
                 action = action_data.get("action", "observe")
                 payload = action_data.get("payload", {})
 
+                # ─── Inspect-Before-Fix Check ───
+                if action in ("inject_css", "inject_js"):
+                    inspection_actions = {
+                        "inspect_element", "cdp_query_selector_all", "cdp_get_computed_style",
+                        "cdp_get_matched_styles", "cdp_get_event_listeners", "search_all_frames",
+                        "cdp_get_network_details", "search_dom", "run_test"
+                    }
+                    recent_actions = self._action_history[-8:] if self._action_history else []
+                    has_inspected = any(act in inspection_actions for act in recent_actions)
+                    if not has_inspected:
+                        console.print(f"  [bold red]🚫 INSPECT GATE BLOCKED {action} — no inspection in last 8 turns[/bold red]")
+                        gate_msg = (
+                            "⛔ VALIDATION ERROR: You are attempting to inject CSS or JS without inspecting the element first. "
+                            "You MUST run an inspection action (e.g. inspect_element, cdp_query_selector_all, cdp_get_computed_style, "
+                            "cdp_get_matched_styles, cdp_get_event_listeners, search_all_frames, cdp_get_network_details, search_dom, or run_test) "
+                            "in the last 8 turns to check the element's class/ID/attributes before applying a fix. Guessing CSS selectors or DOM structure is strictly forbidden."
+                        )
+                        await self._log("status", f"Inspect gate blocked {action}.")
+                        self.messages.append({"role": "assistant", "content": full_raw_response})
+                        self.messages.append({
+                            "role": "user",
+                            "content": f"System: {gate_msg}"
+                        })
+                        self._action_history.append(action)
+                        continue
+
+                self._action_history.append(action)
+                if len(self._action_history) > 100:
+                    self._action_history = self._action_history[-100:]
+
                 # ─── Stuck-loop detection (3 layers) ───
                 payload_sig = ""
                 if action == "observe":
                     payload_sig = ""
                 elif action in ("search_dom", "search_console", "search_network",
-                                "search_playbook", "search_fixes", "search_conversations"):
+                                "search_playbook", "search_fixes", "search_context", "search_conversations"):
                     payload_sig = payload.get("query", "")
                 elif action in ("click", "hover", "inspect_element"):
                     payload_sig = payload.get("selector", "")
                 elif action in ("inject_css", "inject_js"):
                     payload_sig = payload.get("code", payload.get("css", ""))
-                elif action in ("cdp_get_computed_style", "cdp_query_selector_all"):
+                elif action in ("cdp_get_computed_style", "cdp_query_selector_all", "cdp_get_matched_styles", "cdp_get_event_listeners", "search_all_frames"):
                     payload_sig = payload.get("selector", "")
+                elif action == "cdp_get_network_details":
+                    payload_sig = payload.get("urlPattern", "")
                 else:
                     payload_sig = str(payload)
 
@@ -428,6 +691,7 @@ class Brain:
                     and len(set(self._recent_actions[-3:])) == 1
                     and self._recent_actions[-1][0] != "run_test"):
                     stuck_action = self._recent_actions[-1][0]
+                    console.print(f"  [bold red]🔄 LOOP: '{stuck_action}' repeated 3x with same payload[/bold red]")
                     await self._log("status", f"⚠️ Loop detected — AI repeated '{stuck_action}' with same payload 3 times.")
                     loop_detected = True
 
@@ -440,16 +704,18 @@ class Brain:
                     # Check for 2-step cycle: AB AB AB (full tuple comparison)
                     if last6[0:2] == last6[2:4] == last6[4:6]:
                         cycle_names = [a[0] for a in last6[0:2]]
+                        console.print(f"  [bold red]🔄 CYCLE: {cycle_names} × 3[/bold red]")
                         await self._log("status", f"⚠️ Cycle detected — AI repeating {cycle_names} pattern.")
                         loop_detected = True
                     # Check for 3-step cycle: ABC ABC (full tuple comparison)
                     elif last6[0:3] == last6[3:6]:
                         cycle_names = [a[0] for a in last6[0:3]]
+                        console.print(f"  [bold red]🔄 CYCLE: {cycle_names} × 2[/bold red]")
                         await self._log("status", f"⚠️ Cycle detected — AI repeating {cycle_names} pattern.")
                         loop_detected = True
 
                 # --- Layer 3: Stagnation (5+ turns of only search/observe/inspect without progress) ---
-                progress_actions = {"click", "inject_css", "inject_js", "post_message", "answer_user", "navigate", "type", "click_at_position", "run_test", "update_plan"}
+                progress_actions = {"click", "inject_css", "inject_js", "post_message", "answer_user", "navigate", "type", "click_at_position", "run_test", "update_plan", "investigate", "verify_fix", "build_report"}
                 if action in progress_actions:
                     self._consecutive_passive_turns = 0
                     self._consecutive_fix_turns = 0
@@ -459,27 +725,37 @@ class Brain:
                 # Track consecutive fix attempts specifically
                 if action in ("inject_css", "inject_js"):
                     self._consecutive_fix_turns += 1
-                elif action in ("post_message", "answer_user", "run_test"):
+                elif action in ("post_message", "answer_user", "run_test", "click", "hover", "scroll", "type", "verify_fix"):
                     self._consecutive_fix_turns = 0
 
                 if not loop_detected and self._consecutive_passive_turns >= 6:
+                    console.print(f"  [bold red]🐌 STAGNATION: {self._consecutive_passive_turns} passive turns[/bold red]")
                     await self._log("status", f"⚠️ Stagnation — {self._consecutive_passive_turns} turns of searching/observing without acting.")
                     loop_detected = True
 
                 if not loop_detected and self._consecutive_fix_turns >= 5:
+                    console.print(f"  [bold red]🔧 FIX LOOP: {self._consecutive_fix_turns} fixes without verification[/bold red]")
                     await self._log("status", f"⚠️ Fix loop — {self._consecutive_fix_turns} consecutive fix injections without verification.")
                     loop_detected = True
 
                 # --- Nudge on any detection ---
                 if loop_detected:
+                    self._log_session_event("loop_detected", {
+                        "action": action,
+                        "passive_turns": self._consecutive_passive_turns,
+                        "fix_turns": self._consecutive_fix_turns,
+                        "recent_actions": [(a, p[:50]) for a, p in self._recent_actions[-6:]],
+                    })
                     self._recent_actions.clear()
                     self._consecutive_passive_turns = 0
                     self._consecutive_fix_turns = 0
 
                     # Diagnostic reset — clear stale hints so fresh diagnose gives clean data
+                    console.print(f"  [bold magenta]🔄 PIVOT: Resetting diagnostics, diff tracker, and re-capturing observation[/bold magenta]")
                     self.detected_scenario = ""
                     self.diagnosis_hints.clear()
                     self._prev_obs_stats = None  # Reset diff tracker for clean comparison
+                    self._verify_gate_override = True
 
                     # Re-capture fresh observation for the pivot
                     try:
@@ -517,15 +793,55 @@ class Brain:
                     self.messages.append({"role": "user", "content": nudge})
                     continue
 
+                # --- Filter parse-error observes from loop detection ---
+                # When JSON parsing fails, the parser defaults to "observe" with a
+                # [JSON_PARSE_ERROR] thought. Don't count these toward loop/stagnation
+                # detection — inject a "respond with JSON" hint instead.
+                is_parse_error = "[JSON_PARSE_ERROR]" in thought
+                if is_parse_error:
+                    # Don't add to _recent_actions (prevents false loop detection)
+                    if self._recent_actions and self._recent_actions[-1] == (action, payload_sig):
+                        self._recent_actions.pop()
+                    # Inject a corrective hint
+                    parse_error_hint = (
+                        "SYSTEM: Your last response was not valid JSON. You MUST respond with a JSON object "
+                        "containing \"thought\", \"action\", and \"payload\" fields. Example:\n"
+                        "{\"thought\": \"...\", \"action\": \"observe\", \"payload\": {}}\n"
+                        "Do NOT output markdown, plain text, or any other format."
+                    )
+                    self.messages.append({"role": "assistant", "content": full_raw_response})
+                    self.messages.append({"role": "user", "content": parse_error_hint})
+                    console.print(f"  [bold yellow]⚠️ JSON parse error — injected format hint[/bold yellow]")
+                    continue
+
+                self._current_payload = payload  # Store for action log payload preview
                 await self._log("action", action)
                 self.messages.append({"role": "assistant", "content": full_raw_response})
 
             except Exception as e:
                 self._consecutive_errors += 1
+                err_type = type(e).__name__
+                err_code = getattr(e, "status_code", "")
+                console.print(f"  [bold red]💥 API ERROR ({self._consecutive_errors}/3): {err_type} {err_code}[/bold red]")
+                console.print(f"    [red]{str(e)[:250]}[/red]")
                 await self._log("status", f"AI API error: {e}")
+
+                # Context overflow recovery: 400 = bad request, likely context too large.
+                # Drop screenshot and trim history aggressively, then retry ONCE.
+                status_code = getattr(e, "status_code", None)
+                if status_code == 400 and self._consecutive_errors <= 2:
+                    console.print(f"  [yellow]🔧 400 recovery: dropping screenshot + trimming history[/yellow]")
+                    # Drop 2 oldest non-pinned messages to free context
+                    if len(self.messages) > 4:
+                        self.messages = [self.messages[0]] + self.messages[3:]
+                    # Retry without screenshot on next turn
+                    self._skip_screenshot_next_turn = True
+                    await asyncio.sleep(1)
+                    continue
 
                 # Circuit breaker — stop after 3 consecutive non-retryable errors
                 if self._consecutive_errors >= 3:
+                    console.print(f"  [bold red]🛑 CIRCUIT BREAKER: 3 consecutive API errors — ending session[/bold red]")
                     await self._log("status", "❌ 3 consecutive API errors. Ending session to prevent infinite loop.")
                     break
 
@@ -535,20 +851,50 @@ class Brain:
 
             # --- Handle post_message (AI speaking to user) ---
             if action in ("post_message", "answer_user"):
+                # ── Hard gate: block post_message if fixes exist but verify_fix hasn't passed ──
+                if self.fix_attempts and not self._verify_fix_passed:
+                    if self._failed_verify_attempts >= 3 or self._verify_gate_override:
+                        # Escalation mode: allow post_message but append a system nudge to write a Failure Report
+                        console.print(f"  [bold yellow]⚠️ ESCALATION UNLOCKED post_message — {self._failed_verify_attempts} failed verification attempt(s)[/bold yellow]")
+                        self.messages.append({
+                            "role": "user",
+                            "content": (
+                                "SYSTEM WARNING: You have failed QA verification 3+ times (or stagnation was detected). "
+                                "The verify gate has been unlocked for ESCALATION. You must now use post_message to deliver "
+                                "a Failure Analysis Report (Root Cause, Fixes Attempted, Where to Implement, Verification/Reasons for failure). "
+                                "Do NOT claim the issue is resolved."
+                            )
+                        })
+                    else:
+                        gate_msg = (
+                            "⛔ BLOCKED: You applied fixes but haven't passed verify_fix yet. "
+                            "Call verify_fix first — it will run a comprehensive QA check on all your fixes. "
+                            "You CANNOT deliver a report until verify_fix passes."
+                        )
+                        console.print(f"  [bold red]🚫 VERIFY GATE BLOCKED post_message — {len(self.fix_attempts)} fix(es) not verified[/bold red]")
+                        await self._log("status", gate_msg)
+                        self.messages.append({
+                            "role": "user",
+                            "content": f"System: {gate_msg}"
+                        })
+                        continue  # Back to top of loop
+
                 # ── Completion gate: block post_message if plan tasks remain ──
                 if self._plan:
                     # Auto-complete "report/deliver" tasks — they ARE the post_message
                     _report_keywords = {"report", "deliver", "compile", "summary", "findings"}
-                    for t in self._plan:
+                    for i, t in enumerate(self._plan):
                         if t["status"] != "done":
                             task_lower = t["task"].lower()
                             if any(kw in task_lower for kw in _report_keywords):
                                 t["status"] = "done"
                                 if not t.get("findings"):
                                     t["findings"] = "Auto-completed: this task is the report delivery itself."
+                                console.print(f"  [dim]✅ Auto-completed report task #{i}: {t['task'][:60]}[/dim]")
 
                     incomplete = [t for t in self._plan if t["status"] != "done"]
                     if incomplete:
+                        done_count = sum(1 for t in self._plan if t["status"] == "done")
                         incomplete_names = [t["task"] for t in incomplete[:5]]
                         gate_msg = (
                             f"⚠️ BLOCKED: You have {len(incomplete)} incomplete plan task(s): "
@@ -556,6 +902,9 @@ class Brain:
                             "Mark each as complete (with findings) or skipped before using post_message. "
                             "Use `update_plan` with `complete` + `findings` for each task."
                         )
+                        console.print(f"  [bold red]🚫 GATE BLOCKED post_message — {done_count}/{len(self._plan)} tasks done, {len(incomplete)} remaining[/bold red]")
+                        for t in incomplete:
+                            console.print(f"    [red]• [{t['status']}] {t['task']}[/red]")
                         await self._log("status", gate_msg)
                         # Inject a simple text nudge — do NOT re-capture observation or
                         # inject screenshots here. The loop top handles observation properly.
@@ -581,6 +930,7 @@ class Brain:
                 )
                 if positive_fix_signals:
                     self.convo.mark_resolved()
+                    console.print(f"  [bold green]✅ Session marked RESOLVED (detected fix signal in message)[/bold green]")
 
                 # Wait for user input (supports multi-line paste)
                 user_input = _read_multiline_input()
@@ -624,8 +974,36 @@ class Brain:
                     self.messages.append({"role": "user", "content": context})
                     continue
 
+            # --- Handle subagent actions (async AI calls) ---
+            if action in SUBAGENT_ACTIONS:
+                self._log_action_routed(action, "subagent", payload)
+                try:
+                    subagent_result = await self._handle_subagent_action(action, payload, obs.get("url", ""))
+                except Exception as sub_err:
+                    console.print(f"  [bold red]💥 Subagent crash ({action}): {type(sub_err).__name__}: {str(sub_err)[:200]}[/bold red]")
+                    self._log_session_event("subagent_crash", {"action": action, "error": str(sub_err)[:500]})
+                    subagent_result = {
+                        "error": f"Subagent {action} crashed: {type(sub_err).__name__}",
+                        "fallback": f"Use manual actions instead. Error: {str(sub_err)[:200]}",
+                    }
+                await self._log("result", subagent_result)
+
+                # JIT: evaluate for contextual hints (pass slim_obs for context-aware hints)
+                jit_hints = self.jit.evaluate(
+                    action=action, payload=payload, result=subagent_result,
+                    turn=self.turn_count, scenario=self.detected_scenario,
+                    slim_obs=slim_obs,
+                )
+                result_msg = f"Subagent result for {action}:\n```json\n{self._safe_json_truncate(subagent_result, 4000)}\n```"
+                if jit_hints:
+                    result_msg += "\n\n" + "\n".join(jit_hints)
+                self._print_jit_debug(jit_hints)
+                self.messages.append({"role": "user", "content": result_msg})
+                continue
+
             # --- Handle local actions (no browser needed) ---
             if action in LOCAL_ACTIONS:
+                self._log_action_routed(action, "local", payload)
                 result = self._handle_local_action(action, payload)
                 await self._log("result", result)
 
@@ -638,27 +1016,77 @@ class Brain:
                     action=action, payload=payload, result=result,
                     turn=self.turn_count, scenario=self.detected_scenario,
                 )
+                # Extract ⚠️_NEXT_STEP before JSON truncation so it's always visible
+                next_step_hint = ""
+                if isinstance(result, dict) and "⚠️_NEXT_STEP" in result:
+                    next_step_hint = str(result.pop("⚠️_NEXT_STEP"))
                 result_msg = f"Action result for {action}:\n```json\n{self._safe_json_truncate(result, 3000)}\n```"
+                if next_step_hint:
+                    result_msg = f"⛔ MANDATORY NEXT STEP: {next_step_hint}\n\n{result_msg}"
                 if jit_hints:
                     result_msg += "\n\n" + "\n".join(jit_hints)
+                self._print_jit_debug(jit_hints)
                 self.messages.append({"role": "user", "content": result_msg})
                 continue
 
             # --- Handle browser actions ---
-            if action in ("inject_js", "inject_css"):
-                self._record_fix_attempt(action_data)
-                fix_code = payload.get("code") or payload.get("css") or ""
-                if fix_code:
-                    self._last_fix_code = fix_code
-                    self._fix_copy_offered = False
-                self.convo.record_fix({
-                    "turn": self.turn_count,
-                    "action": action,
-                    "payload": payload,
-                    "thought": thought,
-                })
+            self._log_action_routed(action, "browser", payload)
 
-            result = await execute_action(self.browser, action, payload)
+            is_rejected = False
+            rejection_reason = ""
+            if action == "inject_css":
+                css_content = payload.get("css") or payload.get("code") or ""
+                normalized_css = re.sub(r'\s+', ' ', css_content).lower()
+                if re.search(r'\b(body|html)\b\s*\{[^}]*\b(width|min-width|max-width)\b', normalized_css):
+                    is_rejected = True
+                    rejection_reason = (
+                        "[error] Action rejected: Modifying the width (width, min-width, max-width) "
+                        "of the <body> or <html> element via CSS is strictly prohibited. Changing body dimensions "
+                        "leads to broken layouts and layout collapse. Use proper browser tools if you need to "
+                        "adjust viewport size."
+                    )
+            elif action == "inject_js":
+                js_content = payload.get("code") or ""
+                normalized_js = re.sub(r'\s+', ' ', js_content).lower()
+                if (
+                    "body.style.width" in normalized_js
+                    or "body.style.minwidth" in normalized_js
+                    or "body.style.maxwidth" in normalized_js
+                    or "html.style.width" in normalized_js
+                    or "html.style.minwidth" in normalized_js
+                    or "html.style.maxwidth" in normalized_js
+                    or "body.style =" in normalized_js
+                    or "html.style =" in normalized_js
+                    or re.search(r'\b(body|html)\.style\b', normalized_js) and re.search(r'\b(width|minwidth|maxwidth)\b', normalized_js)
+                    or re.search(r'queryselector\(\s*[\'"](body|html)[\'"]\s*\)\.style', normalized_js)
+                    or re.search(r'style\.setproperty\(\s*[\'"](min-|max-)?width[\'"]', normalized_js)
+                    or re.search(r'setattribute\(\s*[\'"]style[\'"]\s*,\s*[\'"][^\'"]*\b(width|min-width|max-width)\b', normalized_js)
+                ):
+                    is_rejected = True
+                    rejection_reason = (
+                        "[error] Action rejected: Modifying the width of the <body> or <html> elements "
+                        "via JavaScript style properties is strictly prohibited. Modifying body dimensions "
+                        "bypassing Playwright viewport commands causes layout collapse. Please use standard viewport "
+                        "settings or adjust elements themselves instead of resizing the root body/html layout."
+                    )
+
+            if is_rejected:
+                result = rejection_reason
+            else:
+                if action in ("inject_js", "inject_css"):
+                    self._record_fix_attempt(action_data)
+                    fix_code = payload.get("code") or payload.get("css") or ""
+                    if fix_code:
+                        self._last_fix_code = fix_code
+                        self._fix_copy_offered = False
+                    self.convo.record_fix({
+                        "turn": self.turn_count,
+                        "action": action,
+                        "payload": payload,
+                        "thought": thought,
+                    })
+
+                result = await execute_action(self.browser, action, payload)
             await self._log("result", result)
 
             if action in ("navigate", "click"):
@@ -681,12 +1109,25 @@ class Brain:
                 slim_obs=slim_obs,
             )
 
+            # Screenshot thought format enforcement (multimodal only)
+            if self.multimodal and thought and not thought.lower().startswith("screenshot shows:"):
+                if not jit_hints:  # Only add if no higher-priority JIT hint fired
+                    jit_hints.append(
+                        "⚠️ FORMAT: Your thought MUST start with 'Screenshot shows: [what you see]'. "
+                        "Describe the screenshot FIRST, then reason. This grounds decisions in reality."
+                    )
+
             context = self._build_observation_message(slim_obs, result, obs["url"])
             if jit_hints:
                 context += "\n\n" + "\n".join(jit_hints)
+            self._print_jit_debug(jit_hints)
             self.messages.append({"role": "user", "content": context})
 
-        # Save conversation at end of loop
+        # Print session summary + save conversation
+        try:
+            self._print_session_summary()
+        except Exception:
+            pass  # Never crash on summary
         self._save_convo_sync()
 
     def _handle_local_action(self, action: str, payload: dict) -> dict:
@@ -699,6 +1140,13 @@ class Brain:
             self.diagnosis_hints = result.get("potential_issues", [])
             self.convo.set_scenario(self.detected_scenario)
             self.convo.set_diagnosis_hints(self.diagnosis_hints)
+            # Auto-hint: if context files exist but haven't been searched, add a strong nudge
+            if not self.jit._context_searched and result.get("context_files_available"):
+                result["⚠️_NEXT_STEP"] = (
+                    "MANDATORY: Run `search_context` NOW with product keywords "
+                    "(e.g., 'BIS', 'slide cart', 'iframe', 'modal') BEFORE attempting any fix. "
+                    "Context files contain critical iframe/selector/scoping info."
+                )
             return result
         elif action == "search_dom":
             return search_dom(query)
@@ -710,6 +1158,8 @@ class Brain:
             return read_network_body(payload.get("filename", ""))
         elif action == "search_playbook":
             return search_playbook(query)
+        elif action == "search_context":
+            return search_context(query)
         elif action == "search_fixes":
             return search_fixes(query)
         elif action == "search_conversations":
@@ -729,12 +1179,222 @@ class Brain:
             return self._handle_update_plan(payload)
         return {"error": f"Unknown local action: {action}"}
 
+    async def _handle_subagent_action(self, action: str, payload: dict, url: str) -> dict:
+        """Handle subagent actions — async AI calls that return structured results."""
+        if action == "investigate":
+            query = payload.get("query", self.convo.query or "")
+            result = await self.sub_investigate.run(query=query, url=url)
+            if result:
+                # Update brain state from investigation results
+                self.detected_scenario = result.get("scenario", self.detected_scenario)
+                self.convo.set_scenario(self.detected_scenario)
+                # Mark JIT flags — investigation covers diagnose + search_context
+                self.jit._diagnose_done = True
+                self.jit._context_searched = True
+                if result.get("relevant_playbook_recipes"):
+                    self.jit._playbook_searched = True
+                if result.get("past_fixes"):
+                    self.jit._fixes_searched = True
+                # Log subagent metrics
+                metrics = self.sub_investigate.get_last_metrics()
+                self._log_session_event("subagent_call", {**metrics, "action": action})
+                return result
+            return {"error": "Investigate subagent failed", "fallback": "Use diagnose + search_context manually"}
+
+        elif action == "verify_fix":
+            if not self.fix_attempts:
+                console.print(f"  [yellow]⚠️ verify_fix called but no fixes recorded yet[/yellow]")
+                return {"passed": False, "error": "No fixes have been applied yet. Apply a fix first, then call verify_fix."}
+
+            # Multi-turn QA agent — gets full browser access and runs its own loop
+            query = self.convo.query or ""
+            qa_budget = min(15, max(8, 4 + (2 * len(self.fix_attempts))))
+            result = await self.sub_verify_fix.run(
+                query=query,
+                scenario=self.detected_scenario,
+                fix_attempts=self.fix_attempts,
+                browser=self.browser,
+                capture_fn=capture_observation,
+                execute_fn=execute_action,
+                multimodal=self.multimodal,
+                max_turns=qa_budget,
+            )
+
+            if result:
+                self._verify_fix_passed = result.get("passed", False)
+                if not self._verify_fix_passed:
+                    self._failed_verify_attempts += 1
+                else:
+                    self._failed_verify_attempts = 0
+                    # Auto-complete verification/testing/QA tasks in the plan
+                    _verify_keywords = {"verify", "test", "qa", "check"}
+                    for i, t in enumerate(self._plan):
+                        if t["status"] != "done":
+                            task_lower = t["task"].lower()
+                            if any(kw in task_lower for kw in _verify_keywords):
+                                t["status"] = "done"
+                                if not t.get("findings"):
+                                    t["findings"] = "Auto-completed: verify_fix subagent passed verification successfully."
+                                console.print(f"  [dim]✅ Auto-completed verification task #{i}: {t['task'][:60]}[/dim]")
+                # Mark JIT flag
+                self.jit._verify_fix_done = True
+            else:
+                self._verify_fix_passed = False
+                self._failed_verify_attempts += 1
+                result = {"passed": False, "confidence": 0,
+                          "recommendation": "QA agent failed — use run_test to manually verify"}
+
+            if not self._verify_fix_passed and self._failed_verify_attempts >= 3:
+                result["⚠️_ESCALATION_WARNING"] = (
+                    "QA verification has failed 3+ times. The verify gate has been unlocked for ESCALATION. "
+                    "You must now use post_message to deliver a Failure Analysis Report (Root Cause, Fixes Attempted, "
+                    "Where to Implement, Verification/Reasons for failure). Do NOT claim the issue is resolved."
+                )
+
+            metrics = self.sub_verify_fix.get_last_metrics()
+            self._log_session_event("subagent_call", {
+                **metrics, "action": action,
+                "qa_passed": self._verify_fix_passed,
+                "qa_turns": result.get("_qa_turns", 0),
+            })
+            return result
+
+        elif action == "build_report":
+            query = self.convo.query or ""
+            result_text = await self.sub_build_report.run(
+                query=query, url=url, scenario=self.detected_scenario,
+                fixes=self.convo.fixes, verification=payload.get("verification"),
+                plan=self._plan,
+            )
+            metrics = self.sub_build_report.get_last_metrics()
+            self._log_session_event("subagent_call", {**metrics, "action": action})
+            if result_text:
+                return {"report": result_text, "hint": "Use this report text in your post_message to the user."}
+            return {"error": "Build report subagent failed", "fallback": "Write the report manually with all 4 sections."}
+
+        return {"error": f"Unknown subagent action: {action}"}
+
+    def _log_session_event(self, event_type: str, data: dict):
+        """Log an event to the structured session log.
+
+        Every significant event is captured: AI calls (main + subagent), action routing,
+        history trimming, JIT evaluations, errors, subagent crashes, etc.
+        Written to both in-memory _session_log and scratch/session_log.jsonl.
+        """
+        import time as _time
+        from datetime import datetime
+        event = {
+            "timestamp": _time.time(),
+            "time_human": datetime.now().strftime("%H:%M:%S"),
+            "turn": self.turn_count,
+            "type": event_type,
+            "scenario": self.detected_scenario,
+            "messages_count": len(self.messages),
+            **data,
+        }
+        self._session_log.append(event)
+        # Also write to session log file
+        try:
+            log_path = os.path.join(SCRATCH_DIR, "session_log.jsonl")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event) + "\n")
+        except Exception:
+            pass  # Never crash on logging
+
+    def _log_action_routed(self, action: str, route: str, payload: dict):
+        """Log where an action was routed (subagent / local / browser)."""
+        payload_preview = ""
+        if action in ("inject_css", "inject_js"):
+            code = str(payload.get("code", payload.get("css", "")))[:100]
+            payload_preview = code
+        elif "query" in payload:
+            payload_preview = payload["query"]
+        elif "selector" in payload:
+            payload_preview = payload["selector"]
+
+        self._log_session_event("action_routed", {
+            "action": action,
+            "route": route,
+            "payload_preview": payload_preview,
+        })
+
+    def _print_session_summary(self):
+        """Print end-of-session summary with aggregated stats."""
+        if not self._session_log:
+            return
+
+        total_main_calls = sum(1 for e in self._session_log if e["type"] == "main_agent_call")
+        total_subagent_calls = sum(1 for e in self._session_log if e["type"] == "subagent_call")
+        total_crashes = sum(1 for e in self._session_log if e["type"] == "subagent_crash")
+        total_compressions = sum(1 for e in self._session_log if e["type"] == "history_compressed")
+
+        # Aggregate tokens
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        for e in self._session_log:
+            if e.get("prompt_tokens"):
+                total_prompt_tokens += e["prompt_tokens"]
+            if e.get("completion_tokens"):
+                total_completion_tokens += e["completion_tokens"]
+        total_tokens = total_prompt_tokens + total_completion_tokens
+
+        # Aggregate time
+        total_ai_time = sum(e.get("elapsed_s", 0) for e in self._session_log
+                           if e["type"] in ("main_agent_call", "subagent_call") and isinstance(e.get("elapsed_s"), (int, float)))
+
+        # Per-subagent breakdown
+        subagent_stats = {}
+        for e in self._session_log:
+            if e["type"] == "subagent_call":
+                name = e.get("subagent", e.get("action", "unknown"))
+                if name not in subagent_stats:
+                    subagent_stats[name] = {"calls": 0, "total_time": 0, "total_tokens": 0}
+                subagent_stats[name]["calls"] += 1
+                subagent_stats[name]["total_time"] += e.get("elapsed_s", 0) if isinstance(e.get("elapsed_s"), (int, float)) else 0
+                subagent_stats[name]["total_tokens"] += e.get("total_tokens", 0) or 0
+
+        console.print("\n[bold cyan]═══ SESSION SUMMARY ═══[/bold cyan]")
+        console.print(f"  Turns: {self.turn_count}")
+        console.print(f"  Main agent API calls: {total_main_calls}")
+        console.print(f"  Subagent API calls: {total_subagent_calls}")
+        if total_crashes:
+            console.print(f"  [red]Subagent crashes: {total_crashes}[/red]")
+        if total_compressions:
+            console.print(f"  History compressions: {total_compressions}")
+        if total_tokens:
+            console.print(f"  Total tokens: {total_tokens:,} (prompt: {total_prompt_tokens:,} + completion: {total_completion_tokens:,})")
+        if total_ai_time:
+            console.print(f"  Total AI time: {total_ai_time:.1f}s")
+
+        if subagent_stats:
+            console.print(f"  [dim]── Subagent breakdown ──[/dim]")
+            for name, stats in subagent_stats.items():
+                console.print(f"    {name}: {stats['calls']} calls, {stats['total_time']:.1f}s, {stats['total_tokens']:,} tokens")
+
+        # Write summary to session log
+        self._log_session_event("session_summary", {
+            "total_turns": self.turn_count,
+            "main_agent_calls": total_main_calls,
+            "subagent_calls": total_subagent_calls,
+            "subagent_crashes": total_crashes,
+            "history_compressions": total_compressions,
+            "total_tokens": total_tokens,
+            "total_prompt_tokens": total_prompt_tokens,
+            "total_completion_tokens": total_completion_tokens,
+            "total_ai_time_s": round(total_ai_time, 1),
+            "subagent_breakdown": subagent_stats,
+            "fixes_recorded": len(self.convo.fixes),
+            "resolved": self.convo.resolved,
+        })
+        console.print(f"  [dim]📊 Full log: scratch/session_log.jsonl ({len(self._session_log)} events)[/dim]")
+
     def _handle_update_plan(self, payload: dict) -> dict:
         """Handle the update_plan action — create, update, or complete tasks.
 
         Payload options:
           { "tasks": ["task1", "task2", ...] }           — Set/replace the full task list
           { "complete": 0, "findings": "..." }           — Mark task #0 as done with findings
+          { "complete_all": [{"index": 0, "findings": "..."}, {"index": 1, "findings": "..."}] }  — Batch-complete multiple tasks
           { "in_progress": 1 }                           — Mark task #1 as in_progress
           { "add": "new task description" }              — Append a new task
         """
@@ -745,18 +1405,113 @@ class Brain:
                 return {"error": "tasks must be a non-empty list of strings"}
             if len(tasks) > 20:
                 tasks = tasks[:20]  # Cap at 20 tasks
-            self._plan = [{"task": str(t), "status": "pending", "findings": ""} for t in tasks]
+            # Coerce task items — handle dicts (gemma sends {"task": "...", "status": "..."})
+            clean_tasks = []
+            for t in tasks:
+                if isinstance(t, dict):
+                    # Extract "task" key from dict, fall back to first string value
+                    task_str = t.get("task", t.get("name", t.get("description", "")))
+                    if not task_str:
+                        task_str = next((v for v in t.values() if isinstance(v, str)), str(t))
+                    clean_tasks.append(str(task_str)[:200])
+                elif isinstance(t, str):
+                    clean_tasks.append(t[:200])
+                else:
+                    clean_tasks.append(str(t)[:200])
+            self._plan = [{"task": t, "status": "pending", "findings": ""} for t in clean_tasks]
             return {"success": True, "plan": self._format_plan()}
 
         # Complete a task
         if "complete" in payload:
             idx = payload["complete"]
+            # If AI passes a list to "complete", redirect to complete_all
+            if isinstance(idx, list):
+                return {
+                    "error": "You passed a list to 'complete', but 'complete' expects a single integer index. "
+                    "To batch-complete multiple tasks, use 'complete_all' instead. Example: "
+                    "{\"complete_all\": [{\"index\": 0, \"findings\": \"...\"}, {\"index\": 1, \"findings\": \"...\"}]}"
+                }
             if not isinstance(idx, int) or idx < 0 or idx >= len(self._plan):
                 return {"error": f"Invalid task index: {idx}. Plan has {len(self._plan)} tasks."}
             self._plan[idx]["status"] = "done"
+            findings_text = ""
             if "findings" in payload:
-                self._plan[idx]["findings"] = str(payload["findings"])[:500]
-            return {"success": True, "plan": self._format_plan()}
+                findings_text = str(payload["findings"])[:500]
+                self._plan[idx]["findings"] = findings_text
+            result = {"success": True, "plan": self._format_plan()}
+            # Warn if findings contain negative signals — task might not actually be done
+            if findings_text:
+                _NEG_SIGNALS = ["failed", "not working", "remains", "still broken", "unable",
+                                "could not", "didn't work", "no effect", "unsuccessful", "white",
+                                "not visible", "not found", "error persists", "need to",
+                                "needs to", "need more", "not yet", "incomplete", "partially",
+                                "attempted", "tried but", "refine", "doesn't match", "not applied"]
+                neg_found = [s for s in _NEG_SIGNALS if s in findings_text.lower()]
+                if neg_found:
+                    result["⚠️_warning"] = (
+                        f"Your findings for task #{idx} contain negative signals: {neg_found}. "
+                        "Are you sure this task is actually done? If the fix didn't work, "
+                        "keep the task in_progress and try a different approach."
+                    )
+            return result
+
+        # Batch-complete multiple tasks at once
+        if "complete_all" in payload:
+            batch = payload["complete_all"]
+            if not isinstance(batch, list):
+                return {"error": "complete_all must be a list of {index, findings} objects"}
+            completed = []
+            errors = []
+            warnings = []
+            # Build set of actions actually taken this session for validation
+            session_actions = set(a for a, _ in self._recent_actions) if self._recent_actions else set()
+            session_actions.update(self.jit._actions_used)
+            fix_actions_taken = session_actions & {"inject_css", "inject_js"}
+            verify_actions_taken = session_actions & {
+                "run_test", "inspect_element", "cdp_get_computed_style",
+                "cdp_get_matched_styles", "cdp_get_event_listeners", "search_all_frames", "cdp_get_network_details"
+            }
+
+            for item in batch:
+                if isinstance(item, dict):
+                    idx = item.get("index", item.get("id", item.get("complete", -1)))
+                    findings = str(item.get("findings", ""))[:500]
+                else:
+                    # Handle simple int (just an index with no findings)
+                    idx = item if isinstance(item, int) else -1
+                    findings = ""
+                if not isinstance(idx, int) or idx < 0 or idx >= len(self._plan):
+                    errors.append(f"Invalid index: {idx}")
+                    continue
+
+                # Validate: don't allow completing fix/verify tasks without actual actions
+                task_lower = self._plan[idx]["task"].lower()
+                is_fix_task = any(kw in task_lower for kw in ["fix", "apply", "inject", "patch", "implement"])
+                is_verify_task = any(kw in task_lower for kw in ["verify", "test", "confirm", "validate", "check"])
+                if is_fix_task and not fix_actions_taken:
+                    warnings.append(f"⚠️ Task #{idx} '{self._plan[idx]['task'][:40]}' marked done but NO inject_css/inject_js found in session history. Did you actually apply a fix?")
+                if is_verify_task and not verify_actions_taken:
+                    warnings.append(f"⚠️ Task #{idx} '{self._plan[idx]['task'][:40]}' marked done but NO run_test/inspect found in session history. Did you actually verify?")
+
+                # Skip already-done tasks (don't overwrite)
+                if self._plan[idx]["status"] == "done":
+                    # Preserve existing longer findings
+                    existing = self._plan[idx].get("findings", "")
+                    if findings and len(findings) > len(existing):
+                        self._plan[idx]["findings"] = findings
+                    completed.append(idx)
+                    continue
+
+                self._plan[idx]["status"] = "done"
+                if findings:
+                    self._plan[idx]["findings"] = findings
+                completed.append(idx)
+            result = {"success": True, "completed": completed, "plan": self._format_plan()}
+            if errors:
+                result["errors"] = errors
+            if warnings:
+                result["warnings"] = warnings
+            return result
 
         # Mark in_progress
         if "in_progress" in payload:
@@ -798,7 +1553,7 @@ class Brain:
             line = f"{icon} {i}. {item['task']}"
             if item.get("findings"):
                 # Truncate findings for display
-                findings_short = item["findings"][:120] + ("..." if len(item["findings"]) > 120 else "")
+                findings_short = item["findings"][:200] + ("..." if len(item["findings"]) > 200 else "")
                 line += f"\n     ↳ {findings_short}"
             lines.append(line)
         plan_text = "\n".join(lines)
@@ -860,7 +1615,11 @@ class Brain:
         # Past sessions (convo/) are saved for manual reference but NOT auto-injected.
         # The AI can still use search_conversations / get_conversation_detail if needed.
 
-        context_json = self._safe_json_truncate(context, 12000)
+        budget = self.config.observation_budget
+        context_json = self._safe_json_truncate(context, budget)
+        ctx_len = len(context_json)
+        ctx_pct = round(ctx_len / budget * 100)
+        console.print(f"  [dim]📦 Initial context: {ctx_len:,} chars ({ctx_pct}% of {budget // 1000}k budget)[/dim]")
         if self.multimodal:
             return f"Current page state:\n```json\n{context_json}\n```\n\nThe screenshot is attached as an image. LOOK AT IT and describe what you see."
         else:
@@ -886,7 +1645,11 @@ class Brain:
         if plan_summary:
             context["plan"] = plan_summary
 
-        context_json = self._safe_json_truncate(context, 12000)
+        budget = self.config.observation_budget
+        context_json = self._safe_json_truncate(context, budget)
+        ctx_len = len(context_json)
+        ctx_pct = round(ctx_len / budget * 100)
+        console.print(f"  [dim]📦 Observation context: {ctx_len:,} chars ({ctx_pct}% of {budget // 1000}k budget)[/dim]")
         if self.multimodal:
             return f"Observation after action:\n```json\n{context_json}\n```\n\nFresh screenshot attached. LOOK AT IT and describe what changed."
         else:
@@ -1024,6 +1787,13 @@ class Brain:
                 result["changes_since_last_turn"] = changes
             else:
                 result["changes_since_last_turn"] = ["No significant changes detected"]
+
+        # Log observation diff to CLI for debug visibility
+        if "changes_since_last_turn" in result:
+            changes = result["changes_since_last_turn"]
+            if changes and not (len(changes) == 1 and "No significant" in str(changes[0])):
+                for change in changes:
+                    console.print(f"  [magenta]Δ {change}[/magenta]")
 
         self._prev_obs_stats = current_stats
         return result
@@ -1231,12 +2001,84 @@ Verified: {'Yes' if self.convo.resolved else 'No'}"""
             "payload": action_data.get("payload"),
             "thought": action_data.get("thought"),
         })
+        # Reset verify gate — new fix means previous verification is stale
+        self._verify_fix_passed = False
+        self._failed_verify_attempts = 0
+        self._verify_gate_override = False
+        self.jit._verify_fix_done = False
+        console.print(f"  [dim]🔧 Fix attempt #{len(self.fix_attempts)} recorded (turn {self.turn_count}) — verify gate reset[/dim]")
 
-    def _trim_history(self):
+    async def _trim_history(self):
         """Trim conversation history to keep within model limits.
-        Always preserves the first message (original query + page context)."""
+        Always preserves the first message (original query + page context).
+        Pins critical discovery messages (search_context, diagnose, investigate results).
+        Uses compress subagent to summarize dropped messages instead of losing them."""
         if len(self.messages) > self.config.max_history:
-            # Keep first message (original context) + most recent messages
+            # Identify pinned messages (critical discovery results)
+            _PIN_SIGNALS = [
+                "Action result for search_context:",
+                "Action result for diagnose:",
+                "Subagent result for investigate:",
+                "Subagent result for verify_fix:",
+                "Subagent result for build_report:",
+                "context match(es)",
+                "context_files_available",
+                "⚠️_NEXT_STEP",
+                "SESSION PROGRESS:",  # Compressed history summary
+            ]
             first_msg = self.messages[0]
-            recent = self.messages[-(self.config.max_history - 1):]
-            self.messages = [first_msg] + recent
+            middle = self.messages[1:]  # Everything except first
+
+            pinned = []
+            unpinned = []
+            for msg in middle:
+                content = msg.get("content", "") if isinstance(msg.get("content"), str) else str(msg.get("content", ""))
+                is_pinned = any(sig in content for sig in _PIN_SIGNALS) and msg.get("role") == "user"
+                if is_pinned:
+                    pinned.append(msg)
+                else:
+                    unpinned.append(msg)
+
+            # Budget: max_history - 1 (first msg) - len(pinned)
+            recent_budget = self.config.max_history - 1 - len(pinned)
+            if recent_budget < 4:
+                recent_budget = 4  # Always keep at least 4 recent messages
+                # If pinned messages are too many, drop oldest pinned
+                while len(pinned) > (self.config.max_history - 1 - recent_budget) and len(pinned) > 1:
+                    pinned.pop(0)
+
+            # Messages to keep vs drop
+            if len(unpinned) > recent_budget:
+                to_drop = unpinned[:len(unpinned) - recent_budget]
+                recent = unpinned[-recent_budget:]
+            else:
+                to_drop = []
+                recent = unpinned
+
+            trimmed_count = len(to_drop)
+
+            if trimmed_count > 0:
+                # Try to compress dropped messages into a summary
+                # Only compress if we're dropping 4+ messages (worth the API call)
+                if trimmed_count >= 4:
+                    try:
+                        summary = await self.sub_compress.run(to_drop)
+                        if summary:
+                            # Insert compressed summary as a pinned system message
+                            compressed_msg = {"role": "user", "content": f"[Compressed history from turns 1-{self.turn_count - len(recent) // 2}]\n{summary}"}
+                            pinned.append(compressed_msg)
+                            console.print(f"  [dim]✂️ History compressed: {trimmed_count} messages → summary ({len(summary)} chars)[/dim]")
+                            self._log_session_event("history_compressed", {
+                                "messages_dropped": trimmed_count,
+                                "summary_chars": len(summary),
+                                **self.sub_compress.get_last_metrics(),
+                            })
+                        else:
+                            console.print(f"  [dim]✂️ History trimmed: dropped {trimmed_count} messages (compress failed)[/dim]")
+                    except Exception as e:
+                        console.print(f"  [dim]✂️ History trimmed: dropped {trimmed_count} messages (compress error: {e})[/dim]")
+                else:
+                    console.print(f"  [dim]✂️ History trimmed: dropped {trimmed_count} messages (too few to compress)[/dim]")
+
+                self.messages = [first_msg] + pinned + recent
+                console.print(f"  [dim]   keeping {len(self.messages)}/{self.config.max_history}, {len(pinned)} pinned[/dim]")
