@@ -759,76 +759,53 @@ def _selector_not_found(ctx: _RuleContext) -> bool:
     return "not found" in ctx.result_str.lower()
 
 
-# ─── Progressive Task Completion ─────────────────────────────────
+# ─── Batch Plan Completion ────────────────────────────────────────
 
 @_rule(
     tag="complete_task_before_moving_on",
     hint=(
-        "⚠️ PROGRESSIVE COMPLETION: You just finished work on a task but didn't mark it complete. "
-        "You MUST call `update_plan` with `complete` + `findings` for the current task BEFORE "
-        "starting the next action. Batch-completing at the end wastes turns — the completion gate "
-        "will BLOCK your post_message and force you to go back. Mark tasks done AS YOU GO."
+        "⚠️ PLAN UPDATE OVERDUE: You've done 10+ actions without updating your plan. "
+        "Use `update_plan` with `complete_all` to batch-mark finished tasks with findings. "
+        "Example: `{\"complete_all\": [{\"index\": 0, \"findings\": \"...\"}, {\"index\": 1, \"findings\": \"...\"}]}` "
+        "The completion gate will BLOCK `post_message` if tasks are still incomplete, so "
+        "batch-update your plan at major milestones (after investigation, after fixes, before reporting)."
     ),
-    cooldown=3,
-    priority=10,
+    cooldown=6,
+    priority=8,
 )
 def _complete_task_before_moving_on(ctx: _RuleContext) -> bool:
-    """Fire when AI does a new investigative/fix action without completing the previous task.
+    """Fire when AI hasn't updated the plan in a long time despite doing real work.
 
-    Detects pattern: AI did run_test (verification) → then starts a new action
-    that isn't update_plan (meaning it skipped marking the task complete).
+    Aligned with prompt guidance: "Batch plan updates at major milestones using
+    complete_all to conserve turns." Only fires after 10+ actions without any
+    update_plan call, AND at least one fix+verify cycle has happened in that span.
+    This avoids nagging after every single fix→verify pair.
     """
     if ctx.action == "update_plan":
         return False  # They're doing the right thing
     if ctx.action in ("observe", "post_message", "answer_user"):
-        return False  # Not a new task action
-
-    # Check if the last non-observe action before this was run_test (verification complete)
-    # and the action before that was inject_css/inject_js (a fix was applied)
-    recent = ctx.actions_used[:-1]  # Exclude current action
-    if len(recent) < 2:
         return False
 
-    # Walk backwards past any observes
-    last_meaningful = None
-    second_last = None
-    for a in reversed(recent):
-        if a == "observe":
-            continue
-        if last_meaningful is None:
-            last_meaningful = a
-        elif second_last is None:
-            second_last = a
-            break
-
-    if last_meaningful is None or second_last is None:
-        return False
-
-    # Pattern: fix → verify → [not update_plan] = forgot to complete task
-    fix_actions = {"inject_css", "inject_js", "click", "scroll", "type", "hover"}
-    verify_actions = {
-        "run_test", "inspect_element", "cdp_get_computed_style",
-        "cdp_get_matched_styles", "cdp_get_event_listeners", "search_all_frames", "cdp_get_network_details"
-    }
-
-    if second_last in fix_actions and last_meaningful in verify_actions:
-        return True
-
-    # Also fire if we see 3+ actions since the last update_plan and none of them is update_plan
+    # Count actions since last update_plan
     actions_since_plan = []
     for a in reversed(ctx.actions_used[:-1]):
         if a == "update_plan":
             break
         actions_since_plan.append(a)
 
-    # If 5+ actions without any plan update, and at least one was a fix+verify
-    if len(actions_since_plan) >= 5:
-        has_fix = any(a in fix_actions for a in actions_since_plan)
-        has_verify = any(a in verify_actions for a in actions_since_plan)
-        if has_fix and has_verify:
-            return True
+    # Only fire after 10+ actions without a plan update
+    if len(actions_since_plan) < 10:
+        return False
 
-    return False
+    # And only if real work happened (at least one fix + one verify)
+    fix_actions = {"inject_css", "inject_js"}
+    verify_actions = {
+        "run_test", "inspect_element", "cdp_get_computed_style",
+        "cdp_get_matched_styles", "cdp_get_event_listeners", "search_all_frames", "cdp_get_network_details"
+    }
+    has_fix = any(a in fix_actions for a in actions_since_plan)
+    has_verify = any(a in verify_actions for a in actions_since_plan)
+    return has_fix and has_verify
 
 
 # ─── Task Completion / Runaway Prevention ─────────────────────────
@@ -1323,7 +1300,7 @@ def _verify_without_interact(ctx: _RuleContext) -> bool:
     hint=(
         "⚠️ CRITICAL: Viewport/body width CSS/JS overrides that collapse layouts are prohibited. "
         "Do NOT write CSS targeting body/html width or JS modifying document.body.style.width. "
-        "If you need to test responsive styles, use proper Playwright viewport commands. "
+        "If you need to test responsive styles, use `set_viewport_size` action. "
         "Resizing via CSS/JS breaks layout media queries and causes validation timeouts."
     ),
     cooldown=5,
@@ -1331,31 +1308,17 @@ def _verify_without_interact(ctx: _RuleContext) -> bool:
 )
 def _block_body_resizing(ctx: _RuleContext) -> bool:
     """Fires when the agent attempts to modify body or html width in CSS/JS."""
+    from engine.validators import check_body_resize_css, check_body_resize_js
     if ctx.action == "inject_css":
         css = ctx.payload.get("css") or ctx.payload.get("code") or ""
-        normalized = re.sub(r'\s+', ' ', css).lower()
-        if re.search(r'\b(body|html)\b\s*\{[^}]*\b(width|min-width|max-width)\b', normalized):
+        if check_body_resize_css(css):
             return True
     elif ctx.action == "inject_js":
         code = ctx.payload.get("code") or ""
-        normalized = re.sub(r'\s+', ' ', code).lower()
-        if (
-            "body.style.width" in normalized
-            or "body.style.minwidth" in normalized
-            or "body.style.maxwidth" in normalized
-            or "html.style.width" in normalized
-            or "html.style.minwidth" in normalized
-            or "html.style.maxwidth" in normalized
-            or "body.style =" in normalized
-            or "html.style =" in normalized
-            or re.search(r'\b(body|html)\.style\b', normalized) and re.search(r'\b(width|minwidth|maxwidth)\b', normalized)
-            or re.search(r'queryselector\(\s*[\'"](body|html)[\'"]\s*\)\.style', normalized)
-            or re.search(r'style\.setproperty\(\s*[\'"](min-|max-)?width[\'"]', normalized)
-            or re.search(r'setattribute\(\s*[\'"]style[\'"]\s*,\s*[\'"][^\'"]*\b(width|min-width|max-width)\b', normalized)
-        ):
+        if check_body_resize_js(code):
             return True
     # Or if the action result contains the rejection error message
-    if "[error] Action rejected: Modifying the width of <body>" in ctx.result_str:
+    if "[error] Action rejected: Modifying the width" in ctx.result_str:
         return True
     return False
 
@@ -1474,6 +1437,192 @@ def _resilient_clicking(ctx: _RuleContext) -> bool:
     # Look for ".click(" or ".click;" or similar click calls in the JS code
     if ".click(" in code or ".click;" in code or "click()" in code:
         return True
+    return False
+
+
+# ── Rule: CSS specificity wars — repeated inject_css on same target ──────
+@_rule(
+    tag="css_specificity_wars",
+    hint=(
+        "⚠️ CSS SPECIFICITY CONFLICT: You've injected CSS multiple times but the element still looks wrong. "
+        "Your rules may be getting overridden by higher-specificity theme styles. Options:\n"
+        "1. Use `cdp_get_matched_styles` to see ALL CSS rules and their specificity.\n"
+        "2. Add `!important` to your CSS declarations.\n"
+        "3. Increase specificity with longer selectors (e.g., `body #wrapper .target` instead of `.target`).\n"
+        "4. If the element is inside an iframe, CSS injection won't work — use `inject_js` to inject into the iframe document."
+    ),
+    cooldown=6,
+    priority=8,
+)
+def _css_specificity_wars(ctx: _RuleContext) -> bool:
+    """Fires when inject_css used 2+ times and no_changes_after_fix also likely."""
+    if ctx.action != "inject_css":
+        return False
+    # Count inject_css calls in last 8 actions
+    recent = ctx.actions_used[-8:] if len(ctx.actions_used) >= 8 else ctx.actions_used
+    css_count = sum(1 for a in recent if a == "inject_css")
+    return css_count >= 3
+
+
+# ── Rule: Mobile/responsive testing nudge ────────────────────────────────
+@_rule(
+    tag="mobile_responsive_nudge",
+    hint=(
+        "💡 RESPONSIVE CHECK: You've fixed visual issues at desktop width but haven't tested mobile. "
+        "Many Shopify themes break differently at mobile widths. Use `set_viewport_size` with "
+        "`{\"width\": 375, \"height\": 812}` to test on iPhone-size viewport, then verify your fixes "
+        "still work. Switch back to desktop with `{\"width\": 1280, \"height\": 800}` after."
+    ),
+    cooldown=10,
+    priority=5,
+)
+def _mobile_responsive_nudge(ctx: _RuleContext) -> bool:
+    """Fires after verify_fix passes but no set_viewport_size was ever used."""
+    if ctx.action != "verify_fix":
+        return False
+    # Only fire if verify passed
+    res_str = ctx.result_str.lower()
+    if "fail" in res_str or "error" in res_str:
+        return False
+    # Check if set_viewport_size was ever used this session
+    return "set_viewport_size" not in ctx.actions_used
+
+
+# ── Rule: Shadow DOM awareness ───────────────────────────────────────────
+@_rule(
+    tag="shadow_dom_hint",
+    hint=(
+        "⚠️ SHADOW DOM: Selectors aren't matching but the element exists on the page. "
+        "The element may be inside a Shadow DOM root (common with custom Shopify app embeds). "
+        "Use `search_all_frames` which also searches shadow roots, or use `inject_js` with "
+        "`document.querySelector('host-element').shadowRoot.querySelector('target')` to reach inside."
+    ),
+    cooldown=5,
+    priority=7,
+)
+def _shadow_dom_hint(ctx: _RuleContext) -> bool:
+    """Fires when selector_not_found triggers multiple times — may be shadow DOM."""
+    if ctx.action not in ("click", "inspect_element", "cdp_get_computed_style"):
+        return False
+    res_str = ctx.result_str.lower()
+    if "not found" not in res_str and "no element" not in res_str:
+        return False
+    # Check if this is a repeated failure (3+ selector failures in last 6 actions)
+    recent = ctx.actions_used[-6:] if len(ctx.actions_used) >= 6 else ctx.actions_used
+    selector_actions = ("click", "inspect_element", "cdp_get_computed_style", "cdp_query_selector_all")
+    fail_count = sum(1 for a in recent if a in selector_actions)
+    return fail_count >= 3
+
+
+# ── Rule: Exhaustion fallback — allow post_message after 3+ failed fix attempts ──
+@_rule(
+    tag="exhaustion_fallback",
+    hint=(
+        "💡 EXHAUSTION FALLBACK: You've attempted 3+ fixes that didn't fully resolve the issue. "
+        "It's OK to `post_message` now with what you've found and attempted. Report:\n"
+        "1. What you diagnosed\n"
+        "2. What fixes you tried and their results\n"
+        "3. What remains unresolved and why\n"
+        "This is better than looping endlessly. Use `build_report` to generate a structured report."
+    ),
+    cooldown=8,
+    priority=9,
+)
+def _exhaustion_fallback(ctx: _RuleContext) -> bool:
+    """Fires when 3+ fix cycles have happened without verify_fix passing."""
+    if ctx.action not in ("inject_css", "inject_js"):
+        return False
+    # Count fix attempts (inject_css + inject_js) in the full session
+    fix_count = sum(1 for a in ctx.actions_used if a in ("inject_css", "inject_js"))
+    # Only fire if we've had 10+ fixes (suggesting 5+ fix-verify cycles) and verify hasn't passed.
+    # Previous threshold of 6 was too low for multi-issue audits (6 issues = 12+ expected fixes).
+    return fix_count >= 10 and not ctx.verify_fix_done
+
+
+# ── Rule: Radio button click interception (Shopify pattern) ──────────────
+@_rule(
+    tag="radio_click_interception",
+    hint=(
+        "⚠️ RADIO BUTTON CLICK FAILED: Shopify themes hide `<input type=\"radio\">` behind visible `<label>` elements. "
+        "The label intercepts pointer events, causing your click to time out. Solutions:\n"
+        "1. Use `click_at_position` targeting the LABEL's coordinates (get them via `cdp_query_selector_all` on the label).\n"
+        "2. Use `inject_js` to programmatically set the radio: `document.querySelector('input#ID').checked = true; "
+        "document.querySelector('input#ID').dispatchEvent(new Event('change', {bubbles: true}));`\n"
+        "Do NOT keep retrying `click` on the same radio input — it will always time out."
+    ),
+    cooldown=5,
+    priority=10,
+)
+def _radio_click_interception(ctx: _RuleContext) -> bool:
+    """Fires when a click on an input fails with pointer interception/timeout."""
+    if ctx.action != "click":
+        return False
+    res_str = ctx.result_str.lower()
+    # Check for timeout or interception error
+    if "timeout" not in res_str and "intercept" not in res_str:
+        return False
+    # Check if the selector targets a radio input
+    selector = (ctx.payload.get("selector") or "").lower()
+    if "input" in selector or "radio" in selector:
+        return True
+    return False
+
+
+# ── Rule: Repeated click failures suggest coordinate-based clicking ──────
+@_rule(
+    tag="repeated_click_failure",
+    hint=(
+        "💡 CLICK KEEPS FAILING: You've had 3+ click failures. The element may be covered by a sticky header, "
+        "overlay, or theme wrapper. Use `cdp_query_selector_all` to get the element's bounding rect, then "
+        "`click_at_position` with coordinates from the rect's center (x + width/2, y + height/2). "
+        "If the element is partially behind a fixed header, scroll down first."
+    ),
+    cooldown=6,
+    priority=9,
+)
+def _repeated_click_failure(ctx: _RuleContext) -> bool:
+    """Fires after 3+ click failures in the last 6 actions."""
+    if ctx.action != "click":
+        return False
+    res_str = ctx.result_str.lower()
+    if "timeout" not in res_str and "failed" not in res_str:
+        return False
+    # Count click failures in recent history
+    recent = ctx.actions_used[-6:] if len(ctx.actions_used) >= 6 else ctx.actions_used
+    click_count = sum(1 for a in recent if a == "click")
+    return click_count >= 3
+
+
+# ── Rule: CSS hiding failed — switch to JS DOM removal ─────────────────
+@_rule(
+    tag="css_to_js_fallback",
+    hint=(
+        "⚠️ CSS HIDING NOT WORKING: You've used inject_css to hide/restyle an element but it's "
+        "still visible. Shopify themes often use `!important`, inline styles, or JS that re-applies "
+        "styles after your CSS loads. Switch to `inject_js` for reliable DOM manipulation:\n"
+        "1. To HIDE: `document.querySelector('#selector').style.setProperty('display','none','important');`\n"
+        "2. To REMOVE entirely: `document.querySelector('#selector')?.remove();`\n"
+        "3. To RESTYLE: `el.style.setProperty('prop','value','important');` — this beats any CSS specificity.\n"
+        "inject_js with `.style.setProperty()` always wins over CSS because it sets inline `!important`."
+    ),
+    cooldown=5,
+    priority=9,
+)
+def _css_to_js_fallback(ctx: _RuleContext) -> bool:
+    """Fires when inject_css was recently used and verify_fix fails or another inject_css follows."""
+    # Fire on verify_fix failure after inject_css
+    if ctx.action == "verify_fix":
+        res_str = ctx.result_str.lower()
+        if "fail" in res_str or "not" in res_str or "still" in res_str:
+            recent = ctx.actions_used[-5:] if len(ctx.actions_used) >= 5 else ctx.actions_used
+            if "inject_css" in recent:
+                return True
+    # Also fire on repeated inject_css (2nd+ attempt on same issue without verify passing)
+    if ctx.action == "inject_css":
+        recent = ctx.actions_used[-4:] if len(ctx.actions_used) >= 4 else ctx.actions_used
+        css_count = sum(1 for a in recent if a == "inject_css")
+        if css_count >= 2:
+            return True
     return False
 
 

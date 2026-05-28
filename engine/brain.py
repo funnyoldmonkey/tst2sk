@@ -25,6 +25,7 @@ from engine.search import search_dom, search_console, search_network, read_netwo
 from engine.kb import append_fix, search_fixes, search_playbook, find_relevant_fixes, search_context
 from engine.convo_logger import ConvoLogger, copy_fix_to_clipboard, search_conversations, get_conversation_detail
 from engine.jit import JITEngine, _ALL_RULES
+from engine.validators import check_body_resize_css, check_body_resize_js
 
 console = Console()
 SCRATCH_DIR = "scratch"
@@ -135,6 +136,9 @@ class Brain:
         self._verify_gate_override = False
         self._prev_obs_stats: dict | None = None  # Previous observation stats for diff tracking
         self._plan: list[dict] = []  # Persistent task plan: [{task, status, findings}]
+        self._plan_gate_blocks = 0  # Consecutive plan recreation blocks — escape hatch after 3
+        self._last_auto_recovery_action: str | None = None  # Prevent auto-recovery loops
+        self._report_generated = False  # True after build_report succeeds — steer to post_message
         self.jit = JITEngine()  # Just-In-Time contextual hint engine
         self.multimodal = config.multimodal  # True = send screenshots, False = text-only
         self._current_payload = {}  # Stored for action log payload preview
@@ -633,6 +637,90 @@ class Brain:
                 action = action_data.get("action", "observe")
                 payload = action_data.get("payload", {})
 
+                # ─── Empty Thought Auto-Recovery ───
+                # When the model returns an empty thought + observe, it's stalled.
+                # Recover immediately on the FIRST empty response — no reason to waste turns.
+                # NOTE: The AI client returns "[Empty response from model]" as a sentinel
+                # when the model returns null — this is NOT a real thought, treat it as empty.
+                _EMPTY_SENTINELS = {"", "[empty response from model]"}
+                _is_empty_thought = thought.strip().lower() in _EMPTY_SENTINELS
+                if _is_empty_thought and action == "observe":
+                    self._consecutive_empty_responses = getattr(self, "_consecutive_empty_responses", 0) + 1
+                    self._total_empty_responses = getattr(self, "_total_empty_responses", 0) + 1
+                    console.print(f"  [bold yellow]🔄 AUTO-RECOVERY: Empty response #{self._total_empty_responses} (consecutive: {self._consecutive_empty_responses})[/bold yellow]")
+
+                    # Smart recovery based on session state — trigger on FIRST empty.
+                    # DEDUP: If the last auto-recovery chose the same action, skip it
+                    # to avoid triggering loop detection (3x same action = pivot reset).
+                    # Check if verify gate would block post_message
+                    _verify_gate_would_block = (self.fix_attempts and not self._verify_fix_passed
+                                                and self._failed_verify_attempts < 3
+                                                and not self._verify_gate_override)
+
+                    _candidate = None
+                    if self._report_generated and not _verify_gate_would_block:
+                        # Report already built AND verify gate won't block — go to delivery
+                        _candidate = "post_message"
+                    elif self.fix_attempts and not self._verify_fix_passed:
+                        _candidate = "verify_fix"
+                    elif self._verify_fix_passed or (self._plan and all(t["status"] == "done" for t in self._plan)):
+                        _candidate = "build_report"
+
+                    # post_message requires the model to compose the payload, so always nudge for it
+                    if _candidate == "post_message":
+                        nudge = (
+                            "SYSTEM: Your last response was empty. A REPORT HAS ALREADY BEEN BUILT. "
+                            "Use post_message NOW to deliver the report to the user. Do NOT call build_report again."
+                        )
+                        self.messages.append({"role": "user", "content": nudge})
+                        self._last_auto_recovery_action = "post_message"
+                        console.print("  [bold yellow]  → nudge to post_message (report ready)[/bold yellow]")
+                        continue
+
+                    if _candidate and _candidate != self._last_auto_recovery_action:
+                        action = _candidate
+                        payload = {}
+                        thought = f"[AUTO-RECOVERY] Empty response detected — auto-triggering {action}."
+                        self._last_auto_recovery_action = action
+                        console.print(f"  [bold yellow]  → {action}[/bold yellow]")
+                    else:
+                        # Fallback: nudge the model instead of repeating the same auto-action
+                        if self._report_generated and not _verify_gate_would_block:
+                            nudge = (
+                                "SYSTEM: Your last response was empty. A REPORT HAS ALREADY BEEN BUILT. "
+                                "Use post_message NOW to deliver the report. Do NOT call build_report again."
+                            )
+                        elif self._report_generated and _verify_gate_would_block:
+                            nudge = (
+                                "SYSTEM: Your last response was empty. A report was built but verify_fix has not passed. "
+                                "You MUST call verify_fix before you can deliver. Run verify_fix NOW."
+                            )
+                        elif self._verify_fix_passed:
+                            nudge = (
+                                "SYSTEM: Your last response was empty. VERIFICATION ALREADY PASSED. "
+                                "Use build_report then post_message NOW to deliver findings to the user."
+                            )
+                        elif self._plan:
+                            next_task = next((t for t in self._plan if t["status"] != "done"), None)
+                            task_hint = f" Next task: '{next_task['task']}'" if next_task else ""
+                            nudge = (
+                                f"SYSTEM: Your last response was empty. You MUST take a concrete action NOW.{task_hint} "
+                                "Do NOT respond with observe — pick an action that makes progress on this task."
+                            )
+                        else:
+                            nudge = (
+                                "SYSTEM: Your last response was empty. You MUST take a concrete action NOW. "
+                                "Review your plan and pick the next incomplete task. If stuck, use post_message "
+                                "to report what you've found so far."
+                            )
+                        self.messages.append({"role": "user", "content": nudge})
+                        self._last_auto_recovery_action = None  # Reset so next empty can auto-act
+                        console.print(f"  [bold yellow]  → nudge (dedup: last was {_candidate})[/bold yellow]")
+                        continue
+                else:
+                    self._consecutive_empty_responses = 0
+                    self._last_auto_recovery_action = None  # Real response — reset dedup
+
                 # ─── Inspect-Before-Fix Check ───
                 if action in ("inject_css", "inject_js"):
                     inspection_actions = {
@@ -782,12 +870,23 @@ class Brain:
                     )
                     if classified.get("suspicious"):
                         nudge += f"⚠️ {classified.get('total_suspicious', 0)} suspicious console errors detected — verify with DOM before trusting.\n"
+
+                    # Include current plan state so the AI doesn't lose track
+                    if self._plan:
+                        done_count = sum(1 for t in self._plan if t["status"] == "done")
+                        total = len(self._plan)
+                        nudge += f"\n📋 YOUR EXISTING PLAN ({done_count}/{total} done) — DO NOT create a new plan:\n"
+                        for i, t in enumerate(self._plan):
+                            status_icon = "✅" if t["status"] == "done" else "🔄" if t["status"] == "in_progress" else "⬜"
+                            nudge += f"  {status_icon} {i}. {t['task']}\n"
+                        nudge += "Continue from the FIRST incomplete task above. Do NOT re-create the plan.\n"
+
                     nudge += (
                         "\nYou MUST do ONE of these NOW:\n"
                         "1. Use post_message to report your findings so far to the user and ask for guidance.\n"
-                        "2. SKIP this audit item and move on to the NEXT one from the user's checklist.\n"
+                        "2. SKIP this audit item and move on to the NEXT incomplete task from your plan above.\n"
                         "3. Try a COMPLETELY DIFFERENT approach — if search_dom isn't working, use run_test with JS to query the DOM directly.\n"
-                        "Do NOT repeat any search you have already done."
+                        "Do NOT repeat any search you have already done. Do NOT create a new plan."
                     )
                     self.messages.append({"role": "assistant", "content": full_raw_response})
                     self.messages.append({"role": "user", "content": nudge})
@@ -891,6 +990,22 @@ class Brain:
                                 if not t.get("findings"):
                                     t["findings"] = "Auto-completed: this task is the report delivery itself."
                                 console.print(f"  [dim]✅ Auto-completed report task #{i}: {t['task'][:60]}[/dim]")
+
+                    # When escalation is unlocked (3+ failed verifications), also auto-complete
+                    # remaining verification/audit tasks. The model has already attempted fixes
+                    # and verification multiple times — don't let the plan gate trap it in a loop
+                    # trying to complete tasks with wrong indices.
+                    _escalation_active = (self._failed_verify_attempts >= 3 or self._verify_gate_override)
+                    if _escalation_active:
+                        _verify_keywords = {"verify", "test", "confirm", "validate", "check", "cart"}
+                        for i, t in enumerate(self._plan):
+                            if t["status"] != "done":
+                                task_lower = t["task"].lower()
+                                if any(kw in task_lower for kw in _verify_keywords):
+                                    t["status"] = "done"
+                                    if not t.get("findings"):
+                                        t["findings"] = "Auto-completed via escalation (3+ failed verify attempts)."
+                                    console.print(f"  [dim]✅ Auto-completed verify task #{i} (escalation): {t['task'][:60]}[/dim]")
 
                     incomplete = [t for t in self._plan if t["status"] != "done"]
                     if incomplete:
@@ -1036,39 +1151,16 @@ class Brain:
             rejection_reason = ""
             if action == "inject_css":
                 css_content = payload.get("css") or payload.get("code") or ""
-                normalized_css = re.sub(r'\s+', ' ', css_content).lower()
-                if re.search(r'\b(body|html)\b\s*\{[^}]*\b(width|min-width|max-width)\b', normalized_css):
+                err = check_body_resize_css(css_content)
+                if err:
                     is_rejected = True
-                    rejection_reason = (
-                        "[error] Action rejected: Modifying the width (width, min-width, max-width) "
-                        "of the <body> or <html> element via CSS is strictly prohibited. Changing body dimensions "
-                        "leads to broken layouts and layout collapse. Use proper browser tools if you need to "
-                        "adjust viewport size."
-                    )
+                    rejection_reason = err
             elif action == "inject_js":
                 js_content = payload.get("code") or ""
-                normalized_js = re.sub(r'\s+', ' ', js_content).lower()
-                if (
-                    "body.style.width" in normalized_js
-                    or "body.style.minwidth" in normalized_js
-                    or "body.style.maxwidth" in normalized_js
-                    or "html.style.width" in normalized_js
-                    or "html.style.minwidth" in normalized_js
-                    or "html.style.maxwidth" in normalized_js
-                    or "body.style =" in normalized_js
-                    or "html.style =" in normalized_js
-                    or re.search(r'\b(body|html)\.style\b', normalized_js) and re.search(r'\b(width|minwidth|maxwidth)\b', normalized_js)
-                    or re.search(r'queryselector\(\s*[\'"](body|html)[\'"]\s*\)\.style', normalized_js)
-                    or re.search(r'style\.setproperty\(\s*[\'"](min-|max-)?width[\'"]', normalized_js)
-                    or re.search(r'setattribute\(\s*[\'"]style[\'"]\s*,\s*[\'"][^\'"]*\b(width|min-width|max-width)\b', normalized_js)
-                ):
+                err = check_body_resize_js(js_content)
+                if err:
                     is_rejected = True
-                    rejection_reason = (
-                        "[error] Action rejected: Modifying the width of the <body> or <html> elements "
-                        "via JavaScript style properties is strictly prohibited. Modifying body dimensions "
-                        "bypassing Playwright viewport commands causes layout collapse. Please use standard viewport "
-                        "settings or adjust elements themselves instead of resizing the root body/html layout."
-                    )
+                    rejection_reason = err
 
             if is_rejected:
                 result = rejection_reason
@@ -1224,18 +1316,19 @@ class Brain:
                 self._verify_fix_passed = result.get("passed", False)
                 if not self._verify_fix_passed:
                     self._failed_verify_attempts += 1
+                    self._report_generated = False  # Report is stale after failed verification
                 else:
                     self._failed_verify_attempts = 0
-                    # Auto-complete verification/testing/QA tasks in the plan
-                    _verify_keywords = {"verify", "test", "qa", "check"}
+                    # ─── FAST-TRACK: Auto-complete ALL remaining plan tasks ───
+                    # When verify_fix passes, the investigation/fix cycle is DONE.
+                    # Auto-complete every remaining task so the plan gate doesn't
+                    # block post_message. The model should go straight to reporting.
                     for i, t in enumerate(self._plan):
                         if t["status"] != "done":
-                            task_lower = t["task"].lower()
-                            if any(kw in task_lower for kw in _verify_keywords):
-                                t["status"] = "done"
-                                if not t.get("findings"):
-                                    t["findings"] = "Auto-completed: verify_fix subagent passed verification successfully."
-                                console.print(f"  [dim]✅ Auto-completed verification task #{i}: {t['task'][:60]}[/dim]")
+                            t["status"] = "done"
+                            if not t.get("findings"):
+                                t["findings"] = "Auto-completed: verify_fix passed — all fixes verified successfully."
+                            console.print(f"  [dim]✅ Auto-completed task #{i} (verify passed): {t['task'][:60]}[/dim]")
                 # Mark JIT flag
                 self.jit._verify_fix_done = True
             else:
@@ -1243,6 +1336,14 @@ class Brain:
                 self._failed_verify_attempts += 1
                 result = {"passed": False, "confidence": 0,
                           "recommendation": "QA agent failed — use run_test to manually verify"}
+
+            # Fast-track hint when verification passes — go straight to report delivery
+            if self._verify_fix_passed:
+                result["⚡_FAST_TRACK"] = (
+                    "VERIFICATION PASSED! All plan tasks have been auto-completed. "
+                    "Your ONLY remaining step is to deliver the report. Use build_report "
+                    "then post_message IMMEDIATELY. Do NOT investigate, do NOT create a new plan."
+                )
 
             if not self._verify_fix_passed and self._failed_verify_attempts >= 3:
                 result["⚠️_ESCALATION_WARNING"] = (
@@ -1269,7 +1370,14 @@ class Brain:
             metrics = self.sub_build_report.get_last_metrics()
             self._log_session_event("subagent_call", {**metrics, "action": action})
             if result_text:
-                return {"report": result_text, "hint": "Use this report text in your post_message to the user."}
+                self._report_generated = True
+                return {
+                    "report": result_text,
+                    "⚡_NEXT_ACTION": (
+                        "REPORT READY. Your ONLY next step is: post_message with this report text. "
+                        "Do NOT call build_report again. Do NOT investigate. Just post_message NOW."
+                    ),
+                }
             return {"error": "Build report subagent failed", "fallback": "Write the report manually with all 4 sections."}
 
         return {"error": f"Unknown subagent action: {action}"}
@@ -1403,6 +1511,36 @@ class Brain:
             tasks = payload["tasks"]
             if not isinstance(tasks, list) or len(tasks) == 0:
                 return {"error": "tasks must be a non-empty list of strings"}
+
+            # ─── Plan Recreation Gate ───
+            # If a plan already exists with incomplete tasks, BLOCK recreation.
+            # The model (especially Flash Lite) tends to recreate plans after pivot
+            # resets, wasting turns. Force it to continue the existing plan instead.
+            # ESCAPE HATCH: After 3 consecutive blocks, the model has clearly lost
+            # context of the old plan (e.g. post-compression). Allow recreation.
+            if self._plan:
+                incomplete = [t for t in self._plan if t["status"] != "done"]
+                done_count = len(self._plan) - len(incomplete)
+                if incomplete:
+                    self._plan_gate_blocks += 1
+                    if self._plan_gate_blocks >= 3:
+                        # Escape hatch — model can't work with the old plan, let it rebuild
+                        console.print(f"  [bold yellow]⚠️ PLAN GATE ESCAPE: {self._plan_gate_blocks} consecutive blocks — allowing plan recreation[/bold yellow]")
+                        self._plan_gate_blocks = 0
+                        self._plan = []  # Clear old plan so new one can be set below
+                    else:
+                        console.print(f"  [bold red]🚫 PLAN GATE: Blocked plan recreation ({self._plan_gate_blocks}/3) — {len(incomplete)} tasks still incomplete[/bold red]")
+                        plan_display = self._format_plan()
+                        return {
+                            "error": (
+                                f"You already have a plan with {len(incomplete)} incomplete tasks "
+                                f"({done_count}/{len(self._plan)} done). Do NOT create a new plan. "
+                                f"Continue from the first incomplete task.\n\n"
+                                f"YOUR EXISTING PLAN:\n{plan_display}\n\n"
+                                f"Use update_plan with 'in_progress', 'complete', or 'add' to manage existing tasks."
+                            )
+                        }
+
             if len(tasks) > 20:
                 tasks = tasks[:20]  # Cap at 20 tasks
             # Coerce task items — handle dicts (gemma sends {"task": "...", "status": "..."})
@@ -1420,6 +1558,9 @@ class Brain:
                     clean_tasks.append(str(t)[:200])
             self._plan = [{"task": t, "status": "pending", "findings": ""} for t in clean_tasks]
             return {"success": True, "plan": self._format_plan()}
+
+        # Any non-recreation action means the model is working with the existing plan — reset gate counter
+        self._plan_gate_blocks = 0
 
         # Complete a task
         if "complete" in payload:
@@ -2003,7 +2144,12 @@ Verified: {'Yes' if self.convo.resolved else 'No'}"""
         })
         # Reset verify gate — new fix means previous verification is stale
         self._verify_fix_passed = False
-        self._failed_verify_attempts = 0
+        self._report_generated = False  # Report is stale after a new fix
+        # NOTE: Do NOT reset _failed_verify_attempts here. The counter tracks
+        # cumulative verify failures across the session. Resetting it on each
+        # new fix means the 3-failure escape valve never triggers if the agent
+        # keeps alternating fix→verify→fail→fix→verify→fail. Only reset when
+        # verify_fix actually passes (see _handle_subagent_action).
         self._verify_gate_override = False
         self.jit._verify_fix_done = False
         console.print(f"  [dim]🔧 Fix attempt #{len(self.fix_attempts)} recorded (turn {self.turn_count}) — verify gate reset[/dim]")

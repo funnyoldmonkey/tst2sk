@@ -5,6 +5,7 @@ import base64
 import io
 from PIL import Image
 from browser.controller import BrowserController
+from engine.validators import check_body_resize_css, check_body_resize_js
 
 SCRATCH_DIR = "scratch"
 
@@ -77,28 +78,9 @@ async def execute_action(browser: BrowserController, action: str, payload: dict)
         elif action == "inject_js":
             code = payload.get("code", "")
             # Intercept and validate to prevent body/viewport width modifications
-            import re
-            normalized_js = re.sub(r'\s+', ' ', code).lower()
-            if (
-                "body.style.width" in normalized_js
-                or "body.style.minwidth" in normalized_js
-                or "body.style.maxwidth" in normalized_js
-                or "html.style.width" in normalized_js
-                or "html.style.minwidth" in normalized_js
-                or "html.style.maxwidth" in normalized_js
-                or "body.style =" in normalized_js
-                or "html.style =" in normalized_js
-                or re.search(r'\b(body|html)\.style\b', normalized_js) and re.search(r'\b(width|minwidth|maxwidth)\b', normalized_js)
-                or re.search(r'queryselector\(\s*[\'"](body|html)[\'"]\s*\)\.style', normalized_js)
-                or re.search(r'style\.setproperty\(\s*[\'"](min-|max-)?width[\'"]', normalized_js)
-                or re.search(r'setattribute\(\s*[\'"]style[\'"]\s*,\s*[\'"][^\'"]*\b(width|min-width|max-width)\b', normalized_js)
-            ):
-                return (
-                    "[error] Action rejected: Modifying the width of the <body> or <html> elements "
-                    "via JavaScript style properties is strictly prohibited. Modifying body dimensions "
-                    "bypassing Playwright viewport commands causes layout collapse. Please use standard viewport "
-                    "settings or adjust elements themselves instead of resizing the root body/html layout."
-                )
+            err = check_body_resize_js(code)
+            if err:
+                return err
 
             # Auto-wrap in IIFE to prevent const/let redeclaration errors.
             # CDP's Runtime.evaluate persists const/let declarations across calls,
@@ -133,15 +115,9 @@ async def execute_action(browser: BrowserController, action: str, payload: dict)
 
         elif action == "inject_css":
             css = payload.get("css", "")
-            import re
-            normalized_css = re.sub(r'\s+', ' ', css).lower()
-            if re.search(r'\b(body|html)\b\s*\{[^}]*\b(width|min-width|max-width)\b', normalized_css):
-                return (
-                    "[error] Action rejected: Modifying the width (width, min-width, max-width) "
-                    "of the <body> or <html> element via CSS is strictly prohibited. Changing body dimensions "
-                    "leads to broken layouts and layout collapse. Use proper browser tools if you need to "
-                    "adjust viewport size."
-                )
+            err = check_body_resize_css(css)
+            if err:
+                return err
 
             await page.add_style_tag(content=css)
             return "inject_css applied"
@@ -583,6 +559,7 @@ async def execute_action(browser: BrowserController, action: str, payload: dict)
                 }
             }"""
             
+            cross_origin_frames = []
             for frame in page.frames:
                 try:
                     elements_data = await frame.evaluate(js_code, [selector])
@@ -592,13 +569,25 @@ async def execute_action(browser: BrowserController, action: str, payload: dict)
                             "frame_name": frame.name or "",
                             "element": el
                         })
-                except Exception:
+                except Exception as e:
+                    # Track cross-origin frames that couldn't be searched
+                    err_str = str(e).lower()
+                    if "cross-origin" in err_str or "security" in err_str or "access" in err_str:
+                        cross_origin_frames.append(frame.url or frame.name or "(unnamed)")
                     continue
-            
-            _save_cdp_result("search_all_frames_results.json", {"selector": selector, "matches": matches})
-            
+
+            _save_cdp_result("search_all_frames_results.json", {"selector": selector, "matches": matches, "cross_origin_skipped": cross_origin_frames})
+
             if not matches:
-                return f"search_all_frames({selector}): No matches found in any frame or shadowRoot."
+                msg = f"search_all_frames({selector}): No matches found in any searchable frame or shadowRoot."
+                if cross_origin_frames:
+                    msg += (
+                        f"\n⚠️ {len(cross_origin_frames)} cross-origin frame(s) could NOT be searched "
+                        f"(security restriction): {cross_origin_frames[:5]}. "
+                        "The element may exist inside one of these frames. "
+                        "Use inject_js with CDP to access cross-origin iframe content."
+                    )
+                return msg
             
             result_str = _json_mod.dumps(matches, indent=1, default=str)
             preview = result_str[:3500]

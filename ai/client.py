@@ -286,7 +286,13 @@ class AIClient:
             if pat_match:
                 payload = {"urlPattern": pat_match.group(1).strip()}
 
-        # observe, clear_site_data, diagnose, cdp_get_cookies, cdp_get_page_metrics — no payload needed
+        elif action == "set_viewport_size":
+            w_match = re.search(r'"width"\s*:\s*(\d+)', raw_text)
+            h_match = re.search(r'"height"\s*:\s*(\d+)', raw_text)
+            if w_match and h_match:
+                payload = {"width": int(w_match.group(1)), "height": int(h_match.group(1))}
+
+        # observe, clear_site_data, reload, diagnose, cdp_get_cookies, cdp_get_page_metrics — no payload needed
 
         # --- Post-message signal detection ---
         # If the action is still "observe" (default fallback) but the raw text looks

@@ -548,7 +548,7 @@ class VerifyFixSubagent(SubagentClient):
     Returns structured verdict: passed/failed with checks and regressions.
     """
 
-    MAX_TURNS = 8
+    MAX_TURNS = 15  # Default cap; brain.py passes dynamic qa_budget (8-15) as max_turns
 
     async def run(
         self,
@@ -572,15 +572,31 @@ class VerifyFixSubagent(SubagentClient):
             "recommendation": str,
         }
         """
-        # Build fix context for the QA agent
+        # Build fix context for the QA agent — include selectors for direct verification
         fixes_summary = []
+        selectors_used = []
         for fix in fix_attempts:
+            payload = fix.get("payload", {})
+            code = payload.get("code") or payload.get("js") or payload.get("css") or ""
             fixes_summary.append({
                 "turn": fix.get("turn"),
                 "action": fix.get("action"),
-                "code": fix.get("payload", {}).get("code") or fix.get("payload", {}).get("css") or "",
+                "code": code,
                 "thought": fix.get("thought") or "",
             })
+            # Extract CSS selectors from fix code for the QA agent
+            # CSS: match selectors before { blocks
+            if fix.get("action") == "inject_css" and code:
+                import re as _re
+                css_selectors = _re.findall(r'([.#][\w\-]+(?:\s+[.#>~+\w\-\[\]="\'*:]+)*)\s*\{', code)
+                selectors_used.extend(css_selectors)
+            # JS: extract querySelector/querySelectorAll arguments
+            if fix.get("action") == "inject_js" and code:
+                import re as _re
+                js_selectors = _re.findall(r"querySelector(?:All)?\(['\"]([^'\"]+)['\"]\)", code)
+                selectors_used.extend(js_selectors)
+        # Deduplicate selectors
+        selectors_used = list(dict.fromkeys(selectors_used))
 
         # Capture initial observation
         try:
@@ -595,13 +611,20 @@ class VerifyFixSubagent(SubagentClient):
         obs_console = obs.get("console", "")[:1000]
         obs_url = obs.get("url", "")
 
+        selectors_block = ""
+        if selectors_used:
+            selectors_block = f"""
+=== SELECTORS USED IN FIXES (use these — do NOT guess new ones) ===
+{chr(10).join(f'  - {s}' for s in selectors_used)}
+"""
+
         initial_message = f"""ORIGINAL ISSUE: {query}
 SCENARIO: {scenario}
 URL: {obs_url}
 
 === FIXES TO VERIFY ({len(fixes_summary)}) ===
 {json.dumps(fixes_summary, indent=1)}
-
+{selectors_block}
 === CURRENT PAGE STATE ===
 DOM (first 3000 chars):
 {obs_dom}
@@ -609,7 +632,7 @@ DOM (first 3000 chars):
 Console:
 {obs_console}
 
-Your job: Verify ALL {len(fixes_summary)} fix(es) actually work, then check for regressions. Start by inspecting the fixed elements."""
+Your job: Verify ALL {len(fixes_summary)} fix(es) actually work, then check for regressions. Use the EXACT selectors listed above — do NOT invent new ones. Start by inspecting the fixed elements."""
 
         # Build conversation history
         messages = [
@@ -641,6 +664,7 @@ Your job: Verify ALL {len(fixes_summary)} fix(es) actually work, then check for 
         interactions_done = 0
         inspections_done = 0
         probes_active = False
+        _verdict_rejections = 0  # Track how many times verdict was rejected
 
         # Multi-turn loop
         verdict = None
@@ -695,8 +719,14 @@ Your job: Verify ALL {len(fixes_summary)} fix(es) actually work, then check for 
                 break
 
             if not raw_text or len(raw_text) < 5:
-                _console.print(f"  [yellow]⚠️ QA turn {turn}: empty response[/yellow]")
-                break
+                _console.print(f"  [yellow]⚠️ QA turn {turn}: empty response — nudging[/yellow]")
+                # Don't break — nudge the agent to continue
+                messages.append({"role": "user", "content": (
+                    "SYSTEM: Your response was empty. You MUST take action NOW. "
+                    f"You have {max_turns - turn} turns remaining. "
+                    "If you've verified enough, submit a verdict. Otherwise, inspect the next fix."
+                )})
+                continue
 
             # Strip thinking tags
             cleaned = _strip_thoughts(raw_text)
@@ -712,6 +742,25 @@ Your job: Verify ALL {len(fixes_summary)} fix(es) actually work, then check for 
             thought = parsed.get("thought", "")
             action = parsed.get("action", "")
             payload = parsed.get("payload", {})
+
+            # Empty thought / empty action detection — same sentinel issue as main loop
+            _EMPTY_SENTINELS = {"", "[empty response from model]"}
+            if (thought.strip().lower() in _EMPTY_SENTINELS and not action) or action == "observe":
+                _console.print(f"  [yellow]⚠️ QA turn {turn}: empty/stalled response — nudging[/yellow]")
+                messages.append({"role": "assistant", "content": cleaned})
+                remaining = max_turns - turn
+                if remaining <= 2:
+                    # Running out of turns — force verdict
+                    messages.append({"role": "user", "content": (
+                        f"SYSTEM: Only {remaining} turn(s) left. You MUST submit a verdict NOW. "
+                        "Use action 'verdict' with your best assessment of passed/failed based on what you've seen."
+                    )})
+                else:
+                    messages.append({"role": "user", "content": (
+                        "SYSTEM: Your response was empty or stalled. Take a concrete verification action. "
+                        f"Use the selectors from the fix list. {remaining} turns remaining."
+                    )})
+                continue
 
             _console.print(f"  [cyan]🔍 QA [{turn}] {action}[/cyan] — {thought[:120]}")
 
@@ -745,14 +794,42 @@ Your job: Verify ALL {len(fixes_summary)} fix(es) actually work, then check for 
 
                 # Block verdict if probes are active and verdict is passed
                 if probes_active and verdict_payload.get("passed", False):
-                    _console.print(f"  [yellow]⚠️ QA turn {turn}: verdict rejected — probes are active[/yellow]")
-                    messages.append({"role": "user", "content": (
-                        "⛔ REJECTED: You cannot return a PASSED verdict while temporary probe injections (inject_css/inject_js) are active. "
-                        "You must either:\n"
-                        "1. Reload the page using 'reload', re-apply the official fixes using 'reapply_fixes', and verify they work in a clean state, OR\n"
-                        "2. Return a FAILED verdict (passed: false) with your recommended fix in the 'recommendation' field so the main agent can officially apply it."
-                    )})
-                    continue
+                    _verdict_rejections += 1
+                    if _verdict_rejections >= 2:
+                        # After 2 rejections, auto-handle: reload + reapply + accept next verdict
+                        _console.print(f"  [yellow]⚠️ QA turn {turn}: verdict rejected {_verdict_rejections}x — auto-resolving probes[/yellow]")
+                        # Auto-reload
+                        try:
+                            await execute_fn(browser, "reload", {})
+                            await asyncio.sleep(2)
+                        except Exception:
+                            pass
+                        # Auto-reapply fixes
+                        _console.print(f"  [magenta]🔄 QA: auto-reapplying {len(fix_attempts)} fix(es) after probe cleanup...[/magenta]")
+                        for fix in fix_attempts:
+                            fix_action = fix.get("action", "")
+                            fix_payload = fix.get("payload", {})
+                            if fix_action in ("inject_css", "inject_js"):
+                                try:
+                                    await execute_fn(browser, fix_action, fix_payload)
+                                except Exception:
+                                    pass
+                        probes_active = False
+                        # Inject a message telling the agent probes are cleared
+                        messages.append({"role": "user", "content": (
+                            "SYSTEM: Probes have been auto-cleared. Page was reloaded and official fixes re-applied. "
+                            "You may now submit your verdict. probes_active = false."
+                        )})
+                        continue
+                    else:
+                        _console.print(f"  [yellow]⚠️ QA turn {turn}: verdict rejected — probes are active[/yellow]")
+                        messages.append({"role": "user", "content": (
+                            "⛔ REJECTED: You cannot return a PASSED verdict while temporary probe injections (inject_css/inject_js) are active. "
+                            "You must either:\n"
+                            "1. Reload the page using 'reload', re-apply the official fixes using 'reapply_fixes', and verify they work in a clean state, OR\n"
+                            "2. Return a FAILED verdict (passed: false) with your recommended fix in the 'recommendation' field so the main agent can officially apply it."
+                        )})
+                        continue
 
                 verdict = verdict_payload
                 # Ensure required fields
@@ -827,6 +904,14 @@ Your job: Verify ALL {len(fixes_summary)} fix(es) actually work, then check for 
             obs_dom_snippet = obs.get("dom", "")[:2000]
             obs_console_snippet = obs.get("console", "")[:500]
 
+            # Add turn budget warning when running low
+            remaining_turns = max_turns - turn
+            budget_warning = ""
+            if remaining_turns <= 3:
+                budget_warning = f"\n⏰ BUDGET WARNING: Only {remaining_turns} turn(s) remaining. Submit your verdict soon!"
+            elif remaining_turns <= 5:
+                budget_warning = f"\n⏰ {remaining_turns} turns remaining."
+
             obs_text = f"""Action result for {action}:
 {str(action_result)[:2000]}
 
@@ -835,7 +920,7 @@ DOM (first 2000 chars):
 {obs_dom_snippet}
 
 Console:
-{obs_console_snippet}"""
+{obs_console_snippet}{budget_warning}"""
 
             # Attach screenshot if multimodal
             if multimodal and obs.get("screenshot_base64"):
